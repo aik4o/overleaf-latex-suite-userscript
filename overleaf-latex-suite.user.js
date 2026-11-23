@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Overleaf LaTeX Suite
 // @namespace    local.overleaf-latex-suite
-// @version      2.1.1
+// @version      2.1.2
 // @description  完整原版片段集、JavaScript/节点片段、作用域、分数、矩阵、Conceal、预览和 Vim 辅助
 // @author       Local adaptation; artisticat1; superle3
 // @license      MIT
@@ -23154,6 +23154,107 @@ ${output}
     }
   });
 
+  // src/overleaf-snippets.js
+  var automaticMath, manualMath, textEnvironments, overleafSnippets;
+  var init_overleaf_snippets = __esm({
+    "src/overleaf-snippets.js"() {
+      automaticMath = {
+        bb: "\\mathbb{$0}$1",
+        cal: "\\mathcal{$0}$1",
+        scr: "\\mathscr{$0}$1",
+        bi: "\\binom{$0}{$1}$2",
+        "c...": "\\cdots ",
+        qq: "\\quad ",
+        linf: "\\liminf_{ ${0:n} \\to ${1:\\infty} } $2",
+        lsup: "\\limsup_{ ${0:n} \\to ${1:\\infty} } $2",
+        xra: "\\xrightarrow{$0}$1",
+        Null: "\\mathrm{null} ",
+        rank: "\\mathrm{rank} ",
+        span: "\\mathrm{span} ",
+        diag: "\\mathrm{diag} ",
+        neq: "\\neq ",
+        geq: "\\geq ",
+        leq: "\\leq ",
+        min: "\\min ",
+        max: "\\max ",
+        Cnn: "\\mathbb{C}^{n \\times n}",
+        TT: "^T",
+        dv: "^",
+        "v--": "^{-1}",
+        "++": "^+",
+        ann: "a_{n}",
+        aii: "a_{i}",
+        ajj: "a_{j}",
+        ap1: "a_{n+1}",
+        aa: "\\alpha",
+        BB: "\\beta",
+        gg: "\\gamma",
+        GG: "\\Gamma",
+        DD: "\\Delta",
+        LA: "\\Lambda",
+        tt: "\\theta",
+        ss: "\\sigma",
+        SS: "\\Sigma",
+        OO: "\\Omega",
+        ":P": "\\Psi",
+        PP: "\\Phi"
+      };
+      manualMath = {
+        mat: "\\begin{matrix}\n$0\n\\end{matrix}$1",
+        tr: "\\mathrm{tr} ",
+        inf: "\\inf ",
+        sup: "\\sup ",
+        sim: "\\sim ",
+        del: "\\nabla",
+        cc: "\\chi",
+        dd: "\\delta",
+        la: "\\lambda",
+        oo: "\\omega"
+      };
+      textEnvironments = [
+        ["axiom", "axm"],
+        ["definition", "def"],
+        ["lemma", "lem"],
+        ["proposition", "prp"],
+        ["theorem", "thm"],
+        ["corollary", "cor"],
+        ["claim", "clm"],
+        ["assumption", "asm"],
+        ["example", "exm"],
+        ["exercise", "exr"],
+        ["conjecture", "cnj"],
+        ["hypothesis", "hyp"],
+        ["remark", "rmk"],
+        ["proof"],
+        ["align"]
+      ];
+      overleafSnippets = [
+        ...Object.entries(automaticMath).map(([trigger, replacement]) => ({ trigger, replacement, options: "mA" })),
+        ...Object.entries(manualMath).map(([trigger, replacement]) => ({ trigger, replacement, options: "m" })),
+        { trigger: "abs", replacement: "\\lvert $0 \\rvert $1", options: "mA", priority: 1 },
+        { trigger: "what", replacement: "\\widehat{$0}$1", options: "mA", priority: 2 },
+        { trigger: "-->", replacement: "\\rightrightarrows ", options: "mA", priority: 1, excludedMacros: ["ce"] },
+        { trigger: /([A-Za-z])cal/, replacement: "\\mathcal{[[0]]}", options: "rmA" },
+        { trigger: /([A-Za-z])rm/, replacement: "\\mathrm{[[0]]}", options: "rmA" },
+        { trigger: /([A-Za-z])det/, replacement: "\\det{[[0]]}", options: "rmA", priority: 1 },
+        { trigger: /([A-Za-z])star/, replacement: "[[0]]^*", options: "rmA" },
+        { trigger: /([A-Za-z])rank/, replacement: "\\mathrm{rank}([[0]])", options: "rmA" },
+        { trigger: /([A-Za-z])null/, replacement: "\\mathrm{null}{[[0]]}", options: "rmA" },
+        { trigger: /([A-Za-z])ran/, replacement: "\\mathrm{ran}([[0]])", options: "rm" },
+        { trigger: /([A-Za-z])tr/, replacement: "\\mathrm{tr}([[0]])", options: "rm" },
+        { trigger: /([A-Za-z0-9})\]])HH/, replacement: "[[0]]^{H}", options: "rmA", priority: 1 },
+        { trigger: "array", replacement: "\\begin{array}{${0:c}}\n$1\n\\end{array}$2", options: "MA", priority: 1 },
+        { trigger: "array", replacement: "\\begin{array}{${0:c}}$1\\end{array}$2", options: "nA", priority: 1 },
+        { trigger: "align", replacement: "\\begin{aligned}$0\\end{aligned}$1", options: "nA", priority: 1 },
+        ...textEnvironments.flatMap(([name, ...aliases]) => [name, ...aliases].map((trigger) => ({
+          trigger,
+          replacement: "\\begin{" + name + "}\n$0\n\\end{" + name + "}$1",
+          options: "tw"
+        })))
+      ];
+    }
+  });
+
   // src/snippet-source.js
   function evaluateSource(source, requireModule, label) {
     const body = source.trim();
@@ -23431,7 +23532,8 @@ ${output}
       builtIn = builtIn.map((snippet) => snippet.trigger === "mk" && snippet.options === "tA" ? { ...snippet, replacement: "$$0$" } : snippet);
       builtIn.unshift(
         { trigger: "dm", replacement: "\\[\n$0\n\\]", options: "tAw" },
-        { trigger: "beg", replacement: "\\begin{$0}\n$1\n\\end{$0}$2", options: "t" }
+        { trigger: "beg", replacement: "\\begin{$0}\n$1\n\\end{$0}$2", options: "t" },
+        ...overleafSnippets
       );
     }
     const custom2 = evaluateSource(preferences.snippetSource, requireModule, "\u81EA\u5B9A\u4E49\u7247\u6BB5");
@@ -23513,6 +23615,7 @@ ${output}
       init_default_text_areas();
       init_sort();
       init_preferences();
+      init_overleaf_snippets();
       init_snippet_source();
       init_preview_text();
       init_preview_styles();
