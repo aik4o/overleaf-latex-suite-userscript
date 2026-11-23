@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Overleaf LaTeX Suite
 // @namespace    local.overleaf-latex-suite
-// @version      2.1.2
+// @version      2.1.3
 // @description  完整原版片段集、JavaScript/节点片段、作用域、分数、矩阵、Conceal、预览和 Vim 辅助
 // @author       Local adaptation; artisticat1; superle3
 // @license      MIT
@@ -38229,9 +38229,12 @@ ${output}
         const char = normalizeGlyph(text2);
         const key = keyFor(char);
         if (!source.has(key)) continue;
-        range.setStart(node, start);
-        range.setEnd(node, offset);
-        const bounds = range.getBoundingClientRect();
+        let bounds = run;
+        if (node.data !== text2 || node.parentElement.childNodes.length !== 1) {
+          range.setStart(node, start);
+          range.setEnd(node, offset);
+          bounds = range.getBoundingClientRect();
+        }
         if (!bounds.width || !bounds.height) continue;
         const glyph = {
           char,
@@ -38250,8 +38253,11 @@ ${output}
     }
     return glyphs;
   }
-  function symbolOffset(geometry, box, position, glyphs, source, allowLiteral) {
-    if (!geometry) return null;
+  function symbolOffset(geometry, box, position, glyphs, source, allowLiteral, selectText) {
+    const selected = normalizeGlyph(selectText?.trim() ?? "");
+    const selectedCommands = glyphs.filter((glyph) => glyph.command && glyph.char === selected);
+    const selectedOffset = selectedCommands.length === 1 ? selectedCommands[0].from : null;
+    if (!geometry) return selectedOffset;
     const symbols2 = new Set(glyphs.map((glyph) => glyph.char));
     const keyFor = (char) => {
       const operator = legacyOperators.get(char);
@@ -38271,7 +38277,7 @@ ${output}
     for (const [key, rendered] of pdf) {
       const written = bySymbol.get(key);
       if (written.length !== rendered.length || written.some((glyph, i2) => glyph.char !== rendered[i2].char && glyph.char !== legacyOperators.get(rendered[i2].char))) continue;
-      if (rendered.length > 1 && (written.some((glyph) => glyph.script) || hasStackedAnnotations) && rendered.some((glyph, i2) => i2 && glyph.left < rendered[i2 - 1].right - 1)) continue;
+      if (rendered.length > 1 && (written.some((glyph) => glyph.script) || hasStackedAnnotations) && rendered.some((glyph, i2) => i2 && glyph.left < rendered[i2 - 1].right - 1 && glyph.top < rendered[i2 - 1].bottom && rendered[i2 - 1].top < glyph.bottom)) continue;
       for (const [i2, glyph] of rendered.entries()) {
         const token = written[i2];
         if (!token.command && !allowLiteral) continue;
@@ -38285,7 +38291,7 @@ ${output}
       }
     }
     const hits = exact.length ? exact : tall;
-    return hits.length === 1 ? hits[0] : null;
+    return hits.length === 1 ? hits[0] : hits.length ? null : selectedOffset;
   }
   var commands, ignoredArguments, legacyOperators, largeOperators;
   var init_pdf_symbols = __esm({
@@ -38371,7 +38377,7 @@ ${output}
     }
     if (braces || nested) return null;
     if (start !== void 0) rows.push({ from: from + start, to: last2.from + close2.index });
-    return rows.length >= 2 ? { rows, trailingBreak: start === void 0 } : null;
+    return rows.length ? { rows, from, to: last2.from + close2.index, trailingBreak: start === void 0 } : null;
   }
   function sourceRange(state, line) {
     const begin = line.from + Math.max(0, line.text.search(/\S/));
@@ -38391,20 +38397,30 @@ ${output}
     const { left, top } = position.offset;
     return box.page === position.page + 1 && left >= box.h - 1 && left <= box.h + box.width + 1 && top >= box.v - box.height - 1 && top <= box.v + 1;
   }
-  function clickedRow(boxes, position, { rows, trailingBreak }) {
+  function alignmentBoxes(boxes) {
     const widest = boxes.reduce((width, box) => Math.max(width, box.width), 0);
     const unique = /* @__PURE__ */ new Map();
     for (const box of boxes) {
-      if (box.width !== widest) continue;
+      if (Math.abs(box.width - widest) > 0.5) continue;
       const key = [box.page, box.h, box.v].join(":");
       if (!unique.has(key) || box.height > unique.get(key).height) unique.set(key, box);
     }
-    const ordered = [...unique.values()].sort((a, b2) => a.page - b2.page || a.v - b2.v);
+    return [...unique.values()].sort((a, b2) => a.page - b2.page || a.v - b2.v);
+  }
+  function clickedRow(ordered, position, { rows, trailingBreak }) {
     if (ordered.length !== rows.length && !(trailingBreak && ordered.length === rows.length + 1)) return null;
     if (ordered.some((box, i2) => i2 && box.page === ordered[i2 - 1].page && Math.abs(box.h - ordered[i2 - 1].h) > 1)) return null;
     const hits = ordered.flatMap((box, i2) => containsClick(box, position) ? [i2] : []);
     const index = hits[0];
     return hits.length === 1 && rows[index] ? { range: rows[index], box: ordered[index] } : null;
+  }
+  function displayBox(boxes, position) {
+    const first = boxes[0];
+    if (!first || first.page !== position.page + 1 || boxes.some((box2) => box2.page !== first.page || Math.abs(box2.h - first.h) > 1)) return null;
+    const top = Math.min(...boxes.map((box2) => box2.v - box2.height));
+    const bottom = Math.max(...boxes.map((box2) => box2.v));
+    const box = { ...first, v: bottom, height: bottom - top };
+    return containsClick(box, position) ? box : null;
   }
   function installPdfSync(views, enabled) {
     const clicks = /* @__PURE__ */ new WeakMap();
@@ -38417,7 +38433,7 @@ ${output}
     window.addEventListener("pointerdown", cancel, true);
     window.addEventListener("keydown", cancel, true);
     window.addEventListener("dblclick", (event) => {
-      const layer = event.target?.closest?.(".textLayer");
+      const layer = event.composedPath().find((node) => node?.matches?.(".textLayer"));
       if (!layer || !enabled()) return;
       const click = { layer, x: event.clientX, y: event.clientY };
       doubleClick = click;
@@ -38447,10 +38463,11 @@ ${output}
       if (!view) return;
       const { doc, selection } = view.state;
       if (!Number.isInteger(line) || line < 1 || line > doc.lines) return;
+      const awaitingNativeJump = doc.lineAt(selection.main.head).number !== line;
       const alignment = sourceRows(doc, line);
       let range, glyphs;
       if (!alignment) {
-        if (!click.geometry) return;
+        if (!click.geometry && !click.selectText?.trim()) return;
         range = sourceRange(view.state, doc.line(line));
         glyphs = sourceGlyphs(doc, range);
         if (!glyphs.some((glyph) => range.math || glyph.command)) return;
@@ -38475,41 +38492,63 @@ ${output}
         if (lookup === entry) lookup = void 0;
         return;
       }
-      if (!stillCurrent() || !views.has(view) || !view.dom.isConnected || view.dom.closest("[hidden]") || view.state.doc !== doc || !view.state.selection.eq(selection) || sourcePath(view, { honorOverride: false }) !== file) return;
+      if (!stillCurrent() || !views.has(view) || !view.dom.isConnected || view.dom.closest("[hidden]") || view.state.doc !== doc || !view.state.selection.eq(selection) && (!awaitingNativeJump || doc.lineAt(view.state.selection.main.head).number !== line) || sourcePath(view, { honorOverride: false }) !== file) return;
       const boxes = pdfBoxes(data.pdf);
-      let box;
-      if (alignment) {
-        const match = clickedRow(boxes, click.position, alignment);
-        if (!match) return;
-        ({ range, box } = match);
-        if (click.geometry) glyphs = sourceGlyphs(doc, range);
-      } else {
-        box = boxes.filter((candidate) => containsClick(candidate, click.position)).sort((a, b2) => b2.width - a.width || b2.height - a.height)[0];
-        if (!box) return;
-      }
-      const symbol = glyphs?.length ? symbolOffset(
+      const locate = (range2, box, allowLiteral) => symbolOffset(
         click.geometry,
         box,
         click.position,
-        glyphs,
-        doc.sliceString(range.from, range.to),
-        Boolean(alignment || range.math)
-      ) : null;
-      const anchor = symbol ?? (alignment ? range.from : null);
+        sourceGlyphs(doc, range2),
+        doc.sliceString(range2.from, range2.to),
+        allowLiteral,
+        click.selectText
+      );
+      let anchor;
+      if (alignment) {
+        const ordered = alignmentBoxes(boxes);
+        const match = clickedRow(ordered, click.position, alignment);
+        anchor = match ? locate(match.range, match.box, true) : null;
+        if (anchor === null) {
+          const display = displayBox(ordered, click.position);
+          if (display) anchor = locate(alignment, display, false);
+        }
+        anchor ??= match?.range.from ?? null;
+      } else {
+        const box = boxes.filter((candidate) => containsClick(candidate, click.position)).sort((a, b2) => b2.width - a.width || b2.height - a.height)[0];
+        if (!box) return;
+        anchor = symbolOffset(
+          click.geometry,
+          box,
+          click.position,
+          glyphs,
+          doc.sliceString(range.from, range.to),
+          range.math,
+          click.selectText
+        );
+      }
       if (anchor === null) return;
       view.dispatch({ selection: { anchor }, effects: EditorView.scrollIntoView(anchor, { y: "center" }) });
     }
     window.addEventListener("editor:gotoLine", ({ detail }) => {
+      const line = detail?.gotoLine;
+      if (!Number.isInteger(line)) {
+        cancel();
+        return;
+      }
       const token = detail?.selectText;
-      const click = clicks.get(token);
+      const taggedClick = clicks.get(token);
+      const click = taggedClick ?? (latestClick?.geometry && !latestClick.receivedJump && token === latestClick.selectText ? latestClick : null);
       if (!click) {
         cancel();
         return;
       }
-      clicks.delete(token);
-      detail.selectText = click.selectText;
+      click.receivedJump = true;
+      if (taggedClick) {
+        clicks.delete(token);
+        detail.selectText = click.selectText;
+      }
       queueMicrotask(() => window.setTimeout(() => {
-        refine(click, detail.gotoLine).catch((reason) => {
+        refine(click, line).catch((reason) => {
           console.debug("[Overleaf LaTeX Suite] PDF sync:", reason);
         });
       }, 0));
