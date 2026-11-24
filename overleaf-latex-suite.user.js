@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Overleaf LaTeX Suite
 // @namespace    local.overleaf-latex-suite
-// @version      2.1.3
+// @version      2.1.4
 // @description  完整原版片段集、JavaScript/节点片段、作用域、分数、矩阵、Conceal、预览和 Vim 辅助
 // @author       Local adaptation; artisticat1; superle3
 // @license      MIT
@@ -3809,7 +3809,7 @@ THE SOFTWARE.
         highlightDollarEnabled: "\u6570\u5B66\u5206\u9694\u7B26\u7740\u8272",
         concealEnabled: "Conceal\uFF1A\u7B26\u53F7\u663E\u793A",
         mathPreviewEnabled: "\u516C\u5F0F\u5B9E\u65F6\u9884\u89C8",
-        pdfSyncEnabled: "PDF \u53CC\u51FB\u5B9A\u4F4D\u5230\u516C\u5F0F\u7B26\u53F7"
+        pdfSyncEnabled: "PDF \u53CC\u51FB\u5B9A\u4F4D\u5E76\u9009\u4E2D\u6E90\u7801"
       };
       advancedFields = {
         builtInProfile: ["\u9ED8\u8BA4\u7247\u6BB5\u96C6", "overleaf", { overleaf: "\u539F\u7248\u7247\u6BB5 + Overleaf \u516C\u5F0F\u73AF\u5883\u9002\u914D", original: "LaTeX Suite \u539F\u7248", none: "\u4EC5\u4F7F\u7528\u81EA\u5B9A\u4E49\u7247\u6BB5" }],
@@ -38157,8 +38157,7 @@ ${output}
     if (char === "\u2212") return "-";
     return /[\u{1D400}-\u{1D7FF}]/u.test(char) ? char.normalize("NFKC") : char;
   }
-  function sourceGlyphs(doc, { from, to }) {
-    const source = doc.sliceString(from, to);
+  function sourceGlyphs(source, from) {
     const glyphs = [];
     let skipTo = 0;
     let depth = 0;
@@ -38187,9 +38186,10 @@ ${output}
       }
       const command = text2.startsWith("\\");
       const name = text2.slice(1);
-      const char = command ? Object.hasOwn(commands, name) ? commands[name] : "" : text2;
-      if (!char || Array.from(char).length !== 1 || !command && "{}$_^&#".includes(char)) continue;
-      glyphs.push({ char: normalizeGlyph(char), from: from + token.start, command, script: script2 });
+      const operator = command && operatorNames.has(name);
+      const char = operator ? name : command ? Object.hasOwn(commands, name) ? commands[name] : "" : text2;
+      if (!char || !operator && Array.from(char).length !== 1 || !command && "{}$_^&#".includes(char)) continue;
+      glyphs.push({ char: normalizeGlyph(char), from: from + token.start, to: from + token.end, command, script: script2 });
     }
     return glyphs;
   }
@@ -38206,11 +38206,27 @@ ${output}
     if (!Number.isFinite(scaleX) || !Number.isFinite(scaleY) || scaleX <= 0 || scaleY <= 0 || Math.abs(scaleX / scaleY - 1) > 0.03 || !rect.width || !rect.height) return null;
     return { layer, canvas, width: rect.width / scaleX, height: rect.height / scaleY };
   }
-  function pdfGlyphs(geometry, box, keyFor, source) {
+  function pdfWordAtClick({ layer, x: x2, y: y2 }) {
+    const point = document.caretPositionFromPoint?.(x2, y2);
+    const caret = point ? null : document.caretRangeFromPoint?.(x2, y2);
+    const node = point?.offsetNode ?? caret?.startContainer;
+    const offset = point?.offset ?? caret?.startOffset;
+    if (node?.nodeType !== 3 || !layer.contains(node)) return null;
+    for (const match of node.data.matchAll(wordPattern)) {
+      const start = match.index;
+      const end = start + match[0].length;
+      if (offset < start || offset > end) continue;
+      const range = pdfRange({ node, start, end });
+      const bounds = range.getBoundingClientRect();
+      if (x2 >= bounds.left && x2 <= bounds.right && y2 >= bounds.top && y2 <= bounds.bottom) return range;
+    }
+    return null;
+  }
+  function* pdfText(geometry, box, pattern, keyFor) {
     const { layer, canvas, width, height } = geometry;
-    if (!layer.isConnected || Number(layer.dataset.mainRotation || 0)) return /* @__PURE__ */ new Map();
+    if (!layer.isConnected || Number(layer.dataset.mainRotation || 0)) return;
     const rect = canvas.getBoundingClientRect();
-    if (!rect.width || !rect.height) return /* @__PURE__ */ new Map();
+    if (!rect.width || !rect.height) return;
     const scaleX = rect.width / width;
     const scaleY = rect.height / height;
     const top = box.v - box.height;
@@ -38218,26 +38234,28 @@ ${output}
     const rowBottom = rect.top + box.v * scaleY;
     const walker = document.createTreeWalker(layer, window.NodeFilter.SHOW_TEXT);
     const range = document.createRange();
-    const glyphs = /* @__PURE__ */ new Map();
     for (let node = walker.nextNode(); node; node = walker.nextNode()) {
       const run = node.parentElement.getBoundingClientRect();
       if (run.bottom + run.height < rowTop || run.top - run.height > rowBottom) continue;
-      let offset = 0;
-      for (const text2 of node.data) {
-        const start = offset;
-        offset += text2.length;
-        const char = normalizeGlyph(text2);
-        const key = keyFor(char);
-        if (!source.has(key)) continue;
+      for (const match of node.data.matchAll(pattern)) {
+        const text2 = match[0];
+        const key = keyFor(text2);
+        if (key === void 0) continue;
+        const start = match.index;
+        const end = start + text2.length;
         let bounds = run;
         if (node.data !== text2 || node.parentElement.childNodes.length !== 1) {
           range.setStart(node, start);
-          range.setEnd(node, offset);
+          range.setEnd(node, end);
           bounds = range.getBoundingClientRect();
         }
         if (!bounds.width || !bounds.height) continue;
         const glyph = {
-          char,
+          text: text2,
+          key,
+          node,
+          start,
+          end,
           left: (bounds.left - rect.left) / scaleX,
           right: (bounds.right - rect.left) / scaleX,
           top: (bounds.top - rect.top) / scaleY,
@@ -38247,58 +38265,106 @@ ${output}
         const y2 = (glyph.top + glyph.bottom) / 2;
         const overhang = largeOperators.has(key) ? (glyph.bottom - glyph.top) / 2 : 1;
         if (x2 < box.h - 1 || x2 > box.h + box.width + 1 || y2 < top - overhang || y2 > box.v + 1) continue;
-        if (!glyphs.has(key)) glyphs.set(key, []);
-        glyphs.get(key).push(glyph);
+        yield glyph;
       }
     }
-    return glyphs;
   }
-  function symbolOffset(geometry, box, position, glyphs, source, allowLiteral, selectText) {
-    const selected = normalizeGlyph(selectText?.trim() ?? "");
-    const selectedCommands = glyphs.filter((glyph) => glyph.command && glyph.char === selected);
-    const selectedOffset = selectedCommands.length === 1 ? selectedCommands[0].from : null;
-    if (!geometry) return selectedOffset;
-    const symbols2 = new Set(glyphs.map((glyph) => glyph.char));
+  function pdfRange({ node, start, end }) {
+    const range = document.createRange();
+    range.setStart(node, start);
+    range.setEnd(node, end);
+    return range;
+  }
+  function hitsText({ left: x2, top: y2 }, glyph) {
+    return x2 >= glyph.left - 0.4 && x2 <= glyph.right + 0.4 && y2 >= glyph.top && y2 <= glyph.bottom;
+  }
+  function normalizeWord(word) {
+    return word.normalize("NFKC").replaceAll("\u2019", "'");
+  }
+  function sourceWords(source, from, glyphs, selected) {
+    if (!selected || selected.match(wordPattern)?.[0] !== selected) return [];
+    const word = normalizeWord(selected);
+    const matches = glyphs.filter((glyph) => glyph.command && normalizeWord(glyph.char) === word);
+    const literalStarts = new Set(glyphs.filter((glyph) => !glyph.command).map((glyph) => glyph.from));
+    for (const match of source.matchAll(wordPattern)) {
+      const start = from + match.index;
+      if (literalStarts.has(start) && normalizeWord(match[0]) === word) {
+        matches.push({ from: start, to: start + match[0].length });
+      }
+    }
+    return matches.sort((a, b2) => a.from - b2.from);
+  }
+  function wordSelection(geometry, box, position, words, selected) {
+    const unique = words.length === 1 ? words[0] : null;
+    if (!words.length || !geometry || !box) return unique;
+    const word = normalizeWord(selected);
+    const rendered = [...pdfText(geometry, box, wordPattern, (text2) => normalizeWord(text2) === word ? word : void 0)];
+    if (rendered.length !== words.length) return unique;
+    const hits = rendered.flatMap((item, index) => hitsText(position.offset, item) ? [index] : []);
+    return hits.length === 1 ? { ...words[hits[0]], pdfRange: pdfRange(rendered[hits[0]]) } : unique;
+  }
+  function symbolSelection(geometry, box, position, glyphs, source, allowLiteral, selectText) {
+    const selected = normalizeGlyph(selectText);
+    const selectedCommands = glyphs.filter((glyph2) => glyph2.command && glyph2.char === selected);
+    const selectedCommand = selectedCommands.length === 1 ? selectedCommands[0] : null;
+    if (!geometry) return selectedCommand;
+    const symbols2 = new Set(glyphs.map((glyph2) => glyph2.char));
     const keyFor = (char) => {
       const operator = legacyOperators.get(char);
       return symbols2.has(operator) ? operator : char;
     };
     const bySymbol = /* @__PURE__ */ new Map();
-    for (const glyph of glyphs) {
-      const key = keyFor(glyph.char);
+    for (const glyph2 of glyphs) {
+      const key = keyFor(glyph2.char);
       if (!bySymbol.has(key)) bySymbol.set(key, []);
-      bySymbol.get(key).push(glyph);
+      bySymbol.get(key).push(glyph2);
     }
-    const pdf = pdfGlyphs(geometry, box, keyFor, bySymbol);
+    const operators2 = [...bySymbol.keys()].filter((key) => operatorNames.has(key)).sort((a, b2) => b2.length - a.length);
+    const pattern = operators2.length ? new RegExp(operators2.join("|") + "|\\S", "gu") : /\S/gu;
+    const pdf = /* @__PURE__ */ new Map();
+    for (const item of pdfText(geometry, box, pattern, (text2) => {
+      const key = keyFor(normalizeGlyph(text2));
+      return bySymbol.has(key) ? key : void 0;
+    })) {
+      if (!pdf.has(item.key)) pdf.set(item.key, []);
+      pdf.get(item.key).push(item);
+    }
     const { left: x2, top: y2 } = position.offset;
     const exact = [];
     const tall = [];
     const hasStackedAnnotations = /\\(?:over|under)set\b|\\stackrel\b/.test(source);
     for (const [key, rendered] of pdf) {
       const written = bySymbol.get(key);
-      if (written.length !== rendered.length || written.some((glyph, i2) => glyph.char !== rendered[i2].char && glyph.char !== legacyOperators.get(rendered[i2].char))) continue;
-      if (rendered.length > 1 && (written.some((glyph) => glyph.script) || hasStackedAnnotations) && rendered.some((glyph, i2) => i2 && glyph.left < rendered[i2 - 1].right - 1 && glyph.top < rendered[i2 - 1].bottom && rendered[i2 - 1].top < glyph.bottom)) continue;
-      for (const [i2, glyph] of rendered.entries()) {
-        const token = written[i2];
-        if (!token.command && !allowLiteral) continue;
-        if (x2 >= glyph.left - 0.4 && x2 <= glyph.right + 0.4 && y2 >= glyph.top && y2 <= glyph.bottom) {
-          exact.push(token.from);
-        } else if (largeOperators.has(token.char)) {
-          const height = glyph.bottom - glyph.top;
-          const width = height * (token.char === "\u222B" ? 0.85 : 1.45);
-          if (x2 >= glyph.left - 1 && x2 <= Math.max(glyph.right, glyph.left + width) && y2 >= glyph.top && y2 <= glyph.top + height * 3.3) tall.push(token.from);
+      if (written.length !== rendered.length || written.some((glyph2, i2) => {
+        const char = normalizeGlyph(rendered[i2].text);
+        return glyph2.char !== char && glyph2.char !== legacyOperators.get(char);
+      })) continue;
+      if (rendered.length > 1 && (written.some((glyph2) => glyph2.script) || hasStackedAnnotations) && rendered.some((glyph2, i2) => i2 && glyph2.left < rendered[i2 - 1].right - 1 && glyph2.top < rendered[i2 - 1].bottom && rendered[i2 - 1].top < glyph2.bottom)) continue;
+      for (const [i2, glyph2] of rendered.entries()) {
+        const token2 = written[i2];
+        if (!token2.command && !allowLiteral) continue;
+        if (hitsText(position.offset, glyph2)) {
+          exact.push({ token: token2, glyph: glyph2 });
+        } else if (largeOperators.has(token2.char)) {
+          const height = glyph2.bottom - glyph2.top;
+          const width = height * (token2.char === "\u222B" ? 0.85 : 1.45);
+          if (x2 >= glyph2.left - 1 && x2 <= Math.max(glyph2.right, glyph2.left + width) && y2 >= glyph2.top && y2 <= glyph2.top + height * 3.3) tall.push({ token: token2, glyph: glyph2 });
         }
       }
     }
     const hits = exact.length ? exact : tall;
-    return hits.length === 1 ? hits[0] : hits.length ? null : selectedOffset;
+    if (hits.length !== 1) return hits.length ? null : selectedCommand;
+    const { token, glyph } = hits[0];
+    return { from: token.from, to: token.to, pdfRange: pdfRange(glyph) };
   }
-  var commands, ignoredArguments, legacyOperators, largeOperators;
+  var commands, operatorNames, wordPattern, ignoredArguments, legacyOperators, largeOperators;
   var init_pdf_symbols = __esm({
     "src/pdf-symbols.js"() {
       init_conceal_maps();
       init_tokenizer();
       commands = { ...cmd_symbols, ...greek2, intop: "\u222B", smallint: "\u222B" };
+      operatorNames = new Set("arccos arcsin arctan arg cos cosh cot coth csc deg det dim exp gcd hom inf ker lg lim ln log max min Pr sec sin sinh sup tan tanh".split(" "));
+      wordPattern = /[\p{L}\p{M}\p{N}]+(?:['’][\p{L}\p{M}\p{N}]+)*/gu;
       ignoredArguments = /* @__PURE__ */ new Set(["\\begin", "\\end", "\\label", "\\tag", "\\phantom", "\\hphantom", "\\vphantom"]);
       legacyOperators = /* @__PURE__ */ new Map([["R", "\u222B"], ["Z", "\u222B"], ["P", "\u2211"], ["X", "\u2211"], ["Q", "\u220F"], ["Y", "\u220F"]]);
       largeOperators = new Set(legacyOperators.values());
@@ -38310,6 +38376,43 @@ ${output}
   __export(pdf_sync_exports, {
     installPdfSync: () => installPdfSync
   });
+  function pdfSelection(layer) {
+    if (!layer) return null;
+    const selection = window.getSelection();
+    if (!selection?.rangeCount || selection.isCollapsed) return null;
+    const range = selection.getRangeAt(0);
+    return layer.contains(range.commonAncestorContainer) ? range.cloneRange() : null;
+  }
+  function paintPdfSelection(range) {
+    const highlights = window.CSS?.highlights;
+    if (!highlights || typeof window.Highlight !== "function") return;
+    if (range && !range.collapsed && range.commonAncestorContainer.isConnected) {
+      highlights.set(pdfHighlight, new window.Highlight(range));
+    } else {
+      highlights.delete(pdfHighlight);
+    }
+  }
+  function sourceSelectionContext(doc, range, click) {
+    const source = doc.sliceString(range.from, range.to);
+    const glyphs = sourceGlyphs(source, range.from);
+    const words = click.nativeRange || click.geometry ? sourceWords(source, range.from, glyphs, click.selected) : [];
+    return { source, glyphs, words };
+  }
+  function matchedSelection({ source, glyphs, words }, click, box, allowLiteral) {
+    const { geometry, position, selected } = click;
+    const word = wordSelection(geometry, box, position, words, selected);
+    if (word && Array.from(selected).length > 1) return word;
+    return symbolSelection(geometry, box, position, glyphs, source, allowLiteral, selected) ?? word;
+  }
+  function selectSource(view, { from, to, pdfRange: pdfRange2 }) {
+    if (pdfRange2) paintPdfSelection(pdfRange2);
+    const selection = view.state.selection.main;
+    if (selection.anchor === from && selection.head === to) return;
+    view.dispatch({
+      selection: { anchor: from, head: to },
+      effects: EditorView.scrollIntoView(from, { y: "center" })
+    });
+  }
   function pdfBuild() {
     const href = document.querySelector(downloadSelector)?.href;
     if (!href) return null;
@@ -38430,8 +38533,16 @@ ${output}
     const cancel = () => {
       latestClick = void 0;
     };
-    window.addEventListener("pointerdown", cancel, true);
-    window.addEventListener("keydown", cancel, true);
+    window.addEventListener("pointerdown", () => {
+      cancel();
+      paintPdfSelection(null);
+    }, true);
+    window.addEventListener("keydown", (event) => {
+      cancel();
+      const modifier = ["Control", "Meta", "Shift", "Alt"].includes(event.key);
+      const copy = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c";
+      if (!modifier && !copy) paintPdfSelection(null);
+    }, true);
     window.addEventListener("dblclick", (event) => {
       const layer = event.composedPath().find((node) => node?.matches?.(".textLayer"));
       if (!layer || !enabled()) return;
@@ -38447,11 +38558,14 @@ ${output}
       cancel();
       const position = detail?.position;
       if (!enabled() || !Number.isInteger(position?.page) || position.page < 0 || !Number.isFinite(position.offset?.left) || !Number.isFinite(position.offset?.top)) return;
+      const nativeRange = clicked && (pdfSelection(clicked.layer) ?? pdfWordAtClick(clicked));
+      if (clicked) paintPdfSelection(nativeRange);
       const build = pdfBuild();
       if (!build) return;
       const selectText = detail.selectText;
+      const selected = (nativeRange?.toString() ?? (typeof selectText === "string" ? selectText : "")).trim();
       const token = new String(selectText ?? "");
-      latestClick = { position, build, selectText, geometry: pdfTextGeometry(clicked, position) };
+      latestClick = { position, build, selectText, selected, nativeRange, geometry: pdfTextGeometry(clicked, position) };
       clicks.set(token, latestClick);
       detail.selectText = token;
     }, true);
@@ -38465,12 +38579,17 @@ ${output}
       if (!Number.isInteger(line) || line < 1 || line > doc.lines) return;
       const awaitingNativeJump = doc.lineAt(selection.main.head).number !== line;
       const alignment = sourceRows(doc, line);
-      let range, glyphs;
+      let range, context;
       if (!alignment) {
-        if (!click.geometry && !click.selectText?.trim()) return;
+        if (!click.geometry && !click.selected) return;
         range = sourceRange(view.state, doc.line(line));
-        glyphs = sourceGlyphs(doc, range);
-        if (!glyphs.some((glyph) => range.math || glyph.command)) return;
+        context = sourceSelectionContext(doc, range, click);
+        const hasMath = range.math || context.glyphs.some((glyph) => glyph.command);
+        if (context.words.length === 1 && !hasMath) {
+          selectSource(view, context.words[0]);
+          return;
+        }
+        if (!hasMath && context.words.length < 2) return;
       }
       const file = sourcePath(view, { honorOverride: false });
       if (!file) return;
@@ -38494,40 +38613,27 @@ ${output}
       }
       if (!stillCurrent() || !views.has(view) || !view.dom.isConnected || view.dom.closest("[hidden]") || view.state.doc !== doc || !view.state.selection.eq(selection) && (!awaitingNativeJump || doc.lineAt(view.state.selection.main.head).number !== line) || sourcePath(view, { honorOverride: false }) !== file) return;
       const boxes = pdfBoxes(data.pdf);
-      const locate = (range2, box, allowLiteral) => symbolOffset(
-        click.geometry,
-        box,
-        click.position,
-        sourceGlyphs(doc, range2),
-        doc.sliceString(range2.from, range2.to),
-        allowLiteral,
-        click.selectText
-      );
-      let anchor;
+      const locate = (range2, box, allowLiteral) => matchedSelection(sourceSelectionContext(doc, range2, click), click, box, allowLiteral);
+      let matched;
       if (alignment) {
         const ordered = alignmentBoxes(boxes);
         const match = clickedRow(ordered, click.position, alignment);
-        anchor = match ? locate(match.range, match.box, true) : null;
-        if (anchor === null) {
+        matched = match ? locate(match.range, match.box, true) : null;
+        if (!matched) {
           const display = displayBox(ordered, click.position);
-          if (display) anchor = locate(alignment, display, false);
+          if (display) matched = locate(alignment, display, false);
         }
-        anchor ??= match?.range.from ?? null;
+        if (!matched && match) matched = { from: match.range.from, to: match.range.from };
       } else {
         const box = boxes.filter((candidate) => containsClick(candidate, click.position)).sort((a, b2) => b2.width - a.width || b2.height - a.height)[0];
         if (!box) return;
-        anchor = symbolOffset(
-          click.geometry,
-          box,
-          click.position,
-          glyphs,
-          doc.sliceString(range.from, range.to),
-          range.math,
-          click.selectText
-        );
+        matched = matchedSelection(context, click, box, range.math);
+        if (!matched && context.words.length > 1) {
+          const display = displayBox(alignmentBoxes(boxes), click.position);
+          if (display) matched = wordSelection(click.geometry, display, click.position, context.words, click.selected);
+        }
       }
-      if (anchor === null) return;
-      view.dispatch({ selection: { anchor }, effects: EditorView.scrollIntoView(anchor, { y: "center" }) });
+      if (matched) selectSource(view, matched);
     }
     window.addEventListener("editor:gotoLine", ({ detail }) => {
       const line = detail?.gotoLine;
@@ -38554,7 +38660,7 @@ ${output}
       }, 0));
     }, true);
   }
-  var downloadSelector;
+  var downloadSelector, pdfHighlight;
   var init_pdf_sync = __esm({
     "src/pdf-sync.js"() {
       init_codemirror();
@@ -38563,6 +38669,7 @@ ${output}
       init_tokenizer();
       init_pdf_symbols();
       downloadSelector = '.toolbar-pdf a[href*="/build/"][href*="/output/"][href*="output.pdf"]';
+      pdfHighlight = "ols-pdf-selection";
     }
   });
 
@@ -38610,6 +38717,7 @@ ${output}
         .ols-preview .katex-display{margin:0;text-align:left}.ols-preview .katex-display>.katex{text-align:left}.ols-preview .katex{white-space:nowrap}
         .ols-preview[data-theme=dark]{background:#252526;border-color:#535353;color:#f0f0f0;box-shadow:0 2px 8px #0005}.ols-preview[data-theme=dark] .ols-preview-status{color:#e4b877}
         .ols-preview .ols-preview-cursor{color:#b76d26}.ols-preview .ols-preview-highlight{background:#eac75c35}.ols-preview .ols-preview-status{font:11px/1.5 system-ui;color:#916633;margin-top:10px;max-width:500px;white-space:normal}.ols-preview .ols-preview-source{font:13px/1.5 monospace;white-space:pre-wrap}
+        .textLayer ::highlight(ols-pdf-selection){background-color:rgba(63,127,255,.4)}
         @media(max-width:600px){.ols-options,.ols-dialog .ols-field{grid-template-columns:1fr}.ols-dialog{padding:14px}}
     `, document.head);
     style.id = "ols-ui-style";
