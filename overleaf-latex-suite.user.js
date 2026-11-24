@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Overleaf LaTeX Suite
 // @namespace    local.overleaf-latex-suite
-// @version      2.1.4
+// @version      2.1.5
 // @description  完整原版片段集、JavaScript/节点片段、作用域、分数、矩阵、Conceal、预览和 Vim 辅助
 // @author       Local adaptation; artisticat1; superle3
 // @license      MIT
@@ -23436,8 +23436,74 @@ ${output}
     }
     return text2;
   }
+  function* selectedBodies(parent, from, to) {
+    for (let node = parent.childAfter(from); node && node.from < to; node = node.nextSibling) {
+      if (isPreviewBody(node)) yield node;
+      else yield* selectedBodies(node, from, to);
+    }
+  }
+  function decoratePreviewSelection(text2, bounds, from, to) {
+    let body = bounds.tree.resolve(from, 1);
+    while (body && (body.to < to || !isPreviewBody(body))) body = body.parent;
+    if (!body) return text2;
+    const offset = bounds.inner_start;
+    const ranges = [];
+    function collect(parent) {
+      let start, end;
+      const finish = () => {
+        if (start === void 0) return;
+        ranges.push({ from: start, to: end });
+        start = void 0;
+      };
+      for (let node = parent.childAfter(from); node && node.from < to; node = node.nextSibling) {
+        if (/^(Whitespace|NewLine)$/.test(node.name)) continue;
+        const source = text2.slice(node.from - offset, node.to - offset);
+        if (/^(Ampersand|Comment)$/.test(node.name) || node.getChild("KnownCtrlSym")?.getChild("LineBreak") || /^\\(?:label|tag|notag|nonumber)\b/.test(source)) {
+          finish();
+          continue;
+        }
+        const plain = /^(MathChar|Number|Normal)$/.test(node.name);
+        if (!plain && (node.from < from || node.to > to && !source.startsWith("\\"))) {
+          const nested = [...selectedBodies(node, from, to)];
+          if (nested.length) {
+            finish();
+            nested.forEach(collect);
+            continue;
+          }
+        }
+        let left = (plain ? Math.max(node.from, from) : node.from) - offset;
+        const right = (plain ? Math.min(node.to, to) : node.to) - offset;
+        if (start === void 0 && /(^|[^\\])[_^]\s*$/.test(text2.slice(0, left))) {
+          const scriptEnd = plain ? left + String.fromCodePoint(text2.codePointAt(left)).length : right;
+          ranges.push({ from: left, to: scriptEnd, script: true });
+          left = scriptEnd;
+        }
+        if (left >= right) continue;
+        start ??= left;
+        end = right;
+      }
+      finish();
+    }
+    collect(body);
+    for (const { from: from2, to: to2, script: script2 } of ranges.reverse()) {
+      const mark = "\\htmlClass{ols-preview-selection}{" + text2.slice(from2, to2) + "}";
+      text2 = text2.slice(0, from2) + (script2 ? "{" + mark + "}" : mark) + text2.slice(to2);
+    }
+    return text2;
+  }
+  function previewEnvironment(state, bounds, text2) {
+    const name = bounds.EnvName;
+    if (!name || !/^(?:(?:align|alignat|flalign|gather|equation)\*?|aligned|alignedat|gathered|split|d?r?cases|[pbBvV]?matrix|smallmatrix|array)$/.test(name)) return text2;
+    const environment = /^flalign/.test(name) ? "align*" : name.replace(/^(align|alignat|gather|equation)$/, "$1*");
+    const begin = bounds.tree.getChild("BeginEnv");
+    const group2 = begin?.getChild("EnvNameGroup");
+    const args = group2 ? state.sliceDoc(group2.to, begin.to) : "";
+    return "\\begin{" + environment + "}" + args + "\n" + text2 + "\n\\end{" + environment + "}";
+  }
+  var isPreviewBody;
   var init_preview_text = __esm({
     "src/preview-text.js"() {
+      isPreviewBody = (node) => /^(Math|LongArg|ShortArg)$/.test(node.name);
     }
   });
 
@@ -37873,6 +37939,10 @@ ${output}
         document.body.append(this.node);
         this.formula = document.createElement("div");
         this.node.append(this.formula);
+        this.selectedSource = document.createElement("code");
+        this.selectedSource.className = "ols-preview-selected-source";
+        this.selectedSource.hidden = true;
+        this.node.append(this.selectedSource);
         this.status = document.createElement("div");
         this.status.className = "ols-preview-status";
         this.status.hidden = true;
@@ -37894,9 +37964,13 @@ ${output}
           this.observedFocus = view.hasFocus;
           rememberStyle(view, settings);
         }
-        const ctx = getContextPlugin(view);
-        const bounds = ctx.getBounds();
-        if (!settings.mathPreviewEnabled || !settings.enabled || !view.hasFocus || !ctx.mode.inMath() || !ctx.mode.inlineMath && !settings.mathPreviewLivePreviewDisplay || !bounds) {
+        const selection = view.state.selection.main;
+        let bounds = getContextPlugin(view).getBounds();
+        if (!selection.empty && (!bounds || bounds.inner_start >= selection.to || bounds.inner_end <= selection.from)) {
+          bounds = getMathBoundsPlugin(view).mathBounds.findLast((bound) => bound.type !== 6 /* TextEnv */ && bound.inner_start < selection.to && bound.inner_end > selection.from);
+        }
+        const inline = bounds?.type === 0 /* DollarInline */ || bounds?.type === 2 /* ParenInline */;
+        if (!settings.mathPreviewEnabled || !settings.enabled || !view.hasFocus || !bounds || !inline && !settings.mathPreviewLivePreviewDisplay) {
           this.node.hidden = true;
           this.text = null;
           this.visible = false;
@@ -37919,42 +37993,57 @@ ${output}
           this.revision = styleRevision;
         }
         const equation = view.state.sliceDoc(bounds.inner_start, bounds.inner_end);
-        this.anchor = bounds.inner_start;
-        const text2 = this.definitions + "\n" + decoratePreview(
-          equation,
-          view.state.selection.main.head - bounds.inner_start,
-          settings
-        );
         if (!equation.trim()) {
           this.node.hidden = true;
           this.text = null;
           this.valid = false;
           return;
         }
-        const display = settings.mathPreviewDisplayStyle || ctx.mode.blockMath;
+        this.anchor = bounds.inner_start;
+        const from = Math.max(selection.from, bounds.inner_start);
+        const to = Math.min(selection.to, bounds.inner_end);
+        const hasSelection = from < to;
+        const wholeFormula = hasSelection && from === bounds.inner_start && to === bounds.inner_end;
+        const marked = hasSelection ? wholeFormula ? equation : decoratePreviewSelection(equation, bounds, from, to) : decoratePreview(equation, selection.head - bounds.inner_start, settings);
+        const selectedSource = hasSelection ? view.state.sliceDoc(selection.from, selection.to) : "";
+        if (this.selectedSource.textContent !== selectedSource) this.selectedSource.textContent = selectedSource;
+        this.selectedSource.hidden = !hasSelection;
+        const base = previewEnvironment(view.state, bounds, equation);
+        const text2 = marked === equation ? base : previewEnvironment(view.state, bounds, marked);
+        const display = settings.mathPreviewDisplayStyle || !inline;
         const origin = sourcePath(view) + ":" + bounds.inner_start;
-        if (this.origin !== origin) this.valid = false;
+        const originChanged = this.origin !== origin;
+        if (originChanged) this.valid = false;
         this.origin = origin;
-        if (text2 !== this.text || this.renderSettings !== settings || this.display !== display) {
+        if (originChanged || text2 !== this.text || base !== this.base || this.renderSettings !== settings || this.display !== display || this.renderDefinitions !== this.definitions) {
+          const rendered = document.createElement("div");
+          const render3 = (expression) => katex.render(this.definitions + "\n\\providecommand{\\label}[1]{}\n" + expression, rendered, {
+            throwOnError: true,
+            trust: (context) => context.command === "\\htmlClass",
+            strict: "ignore",
+            maxExpand: 1e3,
+            maxSize: 10,
+            displayMode: display,
+            output: "html",
+            minRuleThickness: 0.05,
+            macros: { ...settings.previewMacros }
+          });
           try {
-            const rendered = document.createElement("div");
-            katex.render(text2, rendered, {
-              throwOnError: true,
-              trust: (context) => context.command === "\\htmlClass",
-              strict: "ignore",
-              maxExpand: 1e3,
-              maxSize: 10,
-              displayMode: display,
-              output: "html",
-              minRuleThickness: 0.05,
-              macros: { ...settings.previewMacros }
-            });
+            try {
+              render3(text2);
+            } catch (reason) {
+              if (!hasSelection || text2 === base) throw reason;
+              render3(base);
+            }
             this.formula.replaceChildren(...rendered.childNodes);
             this.valid = true;
             this.formula.classList.remove("ols-preview-source");
             this.status.hidden = true;
             this.status.textContent = "";
           } catch (reason) {
+            for (const mark of this.formula.querySelectorAll(".ols-preview-selection")) {
+              mark.classList.remove("ols-preview-selection");
+            }
             if (!this.valid) {
               this.formula.textContent = equation;
               this.formula.classList.add("ols-preview-source");
@@ -37963,9 +38052,12 @@ ${output}
             this.status.textContent = (this.valid ? "\u663E\u793A\u4E0A\u6B21\u6709\u6548\u9884\u89C8\uFF1A" : "\u6682\u4E0D\u80FD\u9884\u89C8\uFF1A") + String(reason.message).replace(/^KaTeX parse error:\s*/, "");
           }
           this.text = text2;
+          this.base = base;
           this.renderSettings = settings;
           this.display = display;
+          this.renderDefinitions = this.definitions;
         }
+        this.formula.classList.toggle("ols-preview-selection", wholeFormula && this.status.hidden);
         this.node.dataset.theme = view.state.facet(EditorView.darkTheme) ? "dark" : "light";
         this.node.style.setProperty("--ols-preview-font-size", settings.mathPreviewFontSize + "px");
         this.node.hidden = false;
@@ -38038,6 +38130,7 @@ ${output}
       init_katex_min();
       init_codemirror();
       init_context();
+      init_mathbounds();
       init_config();
       init_preview_text();
       init_preview_styles();
@@ -38155,10 +38248,17 @@ ${output}
   // src/pdf-symbols.js
   function normalizeGlyph(char) {
     if (char === "\u2212") return "-";
-    return /[\u{1D400}-\u{1D7FF}]/u.test(char) ? char.normalize("NFKC") : char;
+    if (/[\u2100-\u214f\u{1D400}-\u{1D7FF}]/u.test(char)) {
+      const plain = char.normalize("NFKC");
+      if (/^[\p{L}\p{N}]$/u.test(plain)) return plain;
+    }
+    return char;
   }
   function sourceGlyphs(source, from) {
     const glyphs = [];
+    const wrappedGroups = [];
+    let pendingWrapper;
+    let namedOperator;
     let skipTo = 0;
     let depth = 0;
     let scriptDepth = 0;
@@ -38166,6 +38266,18 @@ ${output}
     for (const token of tokenize(source)) {
       const { text: text2 } = token;
       if (token.start < skipTo || text2.startsWith("%")) continue;
+      if (symbolWrappers.has(text2)) {
+        pendingWrapper ??= token.start;
+        namedOperator = text2 === "\\operatorname";
+        continue;
+      }
+      if (text2 === "*" && namedOperator) {
+        namedOperator = false;
+        continue;
+      }
+      const wrapperStart = pendingWrapper;
+      pendingWrapper = void 0;
+      namedOperator = false;
       if (text2 === "_" || text2 === "^") {
         nextScript = true;
         continue;
@@ -38174,7 +38286,14 @@ ${output}
       if (text2 === "{") {
         depth++;
         if (nextScript && !scriptDepth) scriptDepth = depth;
+        if (wrapperStart !== void 0) wrappedGroups.push({ depth, start: wrapperStart, first: glyphs.length });
       } else if (text2 === "}") {
+        const group2 = wrappedGroups.at(-1);
+        if (group2?.depth === depth) {
+          const selection = { from: from + group2.start, to: from + token.end };
+          for (let i2 = group2.first; i2 < glyphs.length; i2++) glyphs[i2].selection = selection;
+          wrappedGroups.pop();
+        }
         if (depth === scriptDepth) scriptDepth = 0;
         depth--;
       }
@@ -38189,7 +38308,14 @@ ${output}
       const operator = command && operatorNames.has(name);
       const char = operator ? name : command ? Object.hasOwn(commands, name) ? commands[name] : "" : text2;
       if (!char || !operator && Array.from(char).length !== 1 || !command && "{}$_^&#".includes(char)) continue;
-      glyphs.push({ char: normalizeGlyph(char), from: from + token.start, to: from + token.end, command, script: script2 });
+      glyphs.push({
+        char: normalizeGlyph(char),
+        from: from + token.start,
+        to: from + token.end,
+        command,
+        script: script2,
+        selection: wrapperStart === void 0 ? void 0 : { from: from + wrapperStart, to: from + token.end }
+      });
     }
     return glyphs;
   }
@@ -38285,14 +38411,16 @@ ${output}
     if (!selected || selected.match(wordPattern)?.[0] !== selected) return [];
     const word = normalizeWord(selected);
     const matches = glyphs.filter((glyph) => glyph.command && normalizeWord(glyph.char) === word);
-    const literalStarts = new Set(glyphs.filter((glyph) => !glyph.command).map((glyph) => glyph.from));
+    const literals = new Map(glyphs.filter((glyph) => !glyph.command).map((glyph) => [glyph.from, glyph]));
     for (const match of source.matchAll(wordPattern)) {
       const start = from + match.index;
-      if (literalStarts.has(start) && normalizeWord(match[0]) === word) {
-        matches.push({ from: start, to: start + match[0].length });
+      const literal2 = literals.get(start);
+      if (literal2 && normalizeWord(match[0]) === word) {
+        const end = start + match[0].length;
+        matches.push({ from: start, to: end, selection: literal2.selection?.to >= end ? literal2.selection : void 0 });
       }
     }
-    return matches.sort((a, b2) => a.from - b2.from);
+    return matches.sort((a, b2) => a.from - b2.from).map((match) => match.selection ?? match);
   }
   function wordSelection(geometry, box, position, words, selected) {
     const unique = words.length === 1 ? words[0] : null;
@@ -38305,8 +38433,9 @@ ${output}
   }
   function symbolSelection(geometry, box, position, glyphs, source, allowLiteral, selectText) {
     const selected = normalizeGlyph(selectText);
-    const selectedCommands = glyphs.filter((glyph2) => glyph2.command && glyph2.char === selected);
-    const selectedCommand = selectedCommands.length === 1 ? selectedCommands[0] : null;
+    const selectedGlyphs = glyphs.filter((glyph2) => glyph2.char === selected);
+    const distinctive = selectedGlyphs.length === 1 ? selectedGlyphs[0] : null;
+    const selectedCommand = distinctive?.selection ?? (distinctive?.command ? distinctive : null);
     if (!geometry) return selectedCommand;
     const symbols2 = new Set(glyphs.map((glyph2) => glyph2.char));
     const keyFor = (char) => {
@@ -38342,7 +38471,7 @@ ${output}
       if (rendered.length > 1 && (written.some((glyph2) => glyph2.script) || hasStackedAnnotations) && rendered.some((glyph2, i2) => i2 && glyph2.left < rendered[i2 - 1].right - 1 && glyph2.top < rendered[i2 - 1].bottom && rendered[i2 - 1].top < glyph2.bottom)) continue;
       for (const [i2, glyph2] of rendered.entries()) {
         const token2 = written[i2];
-        if (!token2.command && !allowLiteral) continue;
+        if (!token2.command && !token2.selection && !allowLiteral) continue;
         if (hitsText(position.offset, glyph2)) {
           exact.push({ token: token2, glyph: glyph2 });
         } else if (largeOperators.has(token2.char)) {
@@ -38355,15 +38484,17 @@ ${output}
     const hits = exact.length ? exact : tall;
     if (hits.length !== 1) return hits.length ? null : selectedCommand;
     const { token, glyph } = hits[0];
-    return { from: token.from, to: token.to, pdfRange: pdfRange(glyph) };
+    const { from, to } = token.selection ?? token;
+    return { from, to, pdfRange: pdfRange(glyph) };
   }
-  var commands, operatorNames, wordPattern, ignoredArguments, legacyOperators, largeOperators;
+  var commands, operatorNames, symbolWrappers, wordPattern, ignoredArguments, legacyOperators, largeOperators;
   var init_pdf_symbols = __esm({
     "src/pdf-symbols.js"() {
       init_conceal_maps();
       init_tokenizer();
       commands = { ...cmd_symbols, ...greek2, intop: "\u222B", smallint: "\u222B" };
       operatorNames = new Set("arccos arcsin arctan arg cos cosh cot coth csc deg det dim exp gcd hom inf ker lg lim ln log max min Pr sec sin sinh sup tan tanh".split(" "));
+      symbolWrappers = new Set("mathbf mathbb mathcal mathscr mathfrak mathrm mathit mathnormal mathsf mathtt boldsymbol bm symbf symbfit symbb symcal symfrak symit symscr symsf symtt symup hat widehat tilde widetilde bar overline underline vec overrightarrow overleftarrow dot ddot dddot check breve acute grave mathring operatorname".split(" ").map((name) => "\\" + name));
       wordPattern = /[\p{L}\p{M}\p{N}]+(?:['’][\p{L}\p{M}\p{N}]+)*/gu;
       ignoredArguments = /* @__PURE__ */ new Set(["\\begin", "\\end", "\\label", "\\tag", "\\phantom", "\\hphantom", "\\vphantom"]);
       legacyOperators = /* @__PURE__ */ new Map([["R", "\u222B"], ["Z", "\u222B"], ["P", "\u2211"], ["X", "\u2211"], ["Q", "\u220F"], ["Y", "\u220F"]]);
@@ -38406,6 +38537,7 @@ ${output}
   }
   function selectSource(view, { from, to, pdfRange: pdfRange2 }) {
     if (pdfRange2) paintPdfSelection(pdfRange2);
+    if (from !== to && !view.hasFocus) view.focus();
     const selection = view.state.selection.main;
     if (selection.anchor === from && selection.head === to) return;
     view.dispatch({
@@ -38584,7 +38716,7 @@ ${output}
         if (!click.geometry && !click.selected) return;
         range = sourceRange(view.state, doc.line(line));
         context = sourceSelectionContext(doc, range, click);
-        const hasMath = range.math || context.glyphs.some((glyph) => glyph.command);
+        const hasMath = range.math || context.glyphs.some((glyph) => glyph.command || glyph.selection);
         if (context.words.length === 1 && !hasMath) {
           selectSource(view, context.words[0]);
           return;
@@ -38717,6 +38849,9 @@ ${output}
         .ols-preview .katex-display{margin:0;text-align:left}.ols-preview .katex-display>.katex{text-align:left}.ols-preview .katex{white-space:nowrap}
         .ols-preview[data-theme=dark]{background:#252526;border-color:#535353;color:#f0f0f0;box-shadow:0 2px 8px #0005}.ols-preview[data-theme=dark] .ols-preview-status{color:#e4b877}
         .ols-preview .ols-preview-cursor{color:#b76d26}.ols-preview .ols-preview-highlight{background:#eac75c35}.ols-preview .ols-preview-status{font:11px/1.5 system-ui;color:#916633;margin-top:10px;max-width:500px;white-space:normal}.ols-preview .ols-preview-source{font:13px/1.5 monospace;white-space:pre-wrap}
+        .ols-preview{--ols-preview-selection-bg:#fcd46b80}.ols-preview[data-theme=dark]{--ols-preview-selection-bg:#f7ba484a}
+        .ols-preview-selection{background:var(--ols-preview-selection-bg);border-radius:2px}
+        .ols-preview-selected-source:not([hidden]){display:block;margin-top:6px;padding:3px 5px;border-radius:3px;background:var(--ols-preview-selection-bg);font:13px/1.4 monospace;white-space:pre-wrap;overflow-wrap:anywhere}
         .textLayer ::highlight(ols-pdf-selection){background-color:rgba(63,127,255,.4)}
         @media(max-width:600px){.ols-options,.ols-dialog .ols-field{grid-template-columns:1fr}.ols-dialog{padding:14px}}
     `, document.head);
