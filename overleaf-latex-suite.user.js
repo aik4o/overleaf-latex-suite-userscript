@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Overleaf LaTeX Suite
 // @namespace    local.overleaf-latex-suite
-// @version      2.1.6
+// @version      2.1.7
 // @description  完整原版片段集、JavaScript/节点片段、作用域、分数、矩阵、Conceal、预览和 Vim 辅助
 // @author       Local adaptation; artisticat1; superle3
 // @license      MIT
@@ -13,7 +13,7 @@
 // @run-at       document-start
 // @noframes
 // ==/UserScript==
-/* Bundled from local source. No remote @require or runtime download.
+/* Bundled from local source. No remote @require or dependency download.
  * Snippet engine: https://github.com/superle3/snippet-leaf
  * Original: https://github.com/artisticat1/obsidian-latex-suite
 Snippetleaf / Obsidian LaTeX Suite
@@ -38871,6 +38871,8 @@ ${output}
   function mountUI(preferences, { save, validate, selectEquation, boxEquation, toggleAll, toggleConceal }) {
     const style = element("style", `
         .ols-button{position:fixed;bottom:12px;right:16px;z-index:10000;border:1px solid #42735d;border-radius:6px;padding:7px 11px;background:#f3fbf6;color:#174b30;font:12px system-ui;cursor:pointer}
+        .ols-local-tex{bottom:48px}.ols-local-tex:disabled{cursor:wait}
+        .ols-local-tex-status{position:fixed;bottom:84px;right:16px;z-index:10000;max-width:min(300px,calc(100vw - 32px));padding:8px 10px;border:1px solid #bc8661;border-radius:6px;background:#fff6ed;color:#6b3521;font:12px/1.4 system-ui}
         .ols-dialog{box-sizing:border-box;width:min(860px,95vw);max-height:90vh;border:1px solid #64748b;border-radius:10px;padding:22px;background:#fff;color:#172b23;font:14px/1.6 system-ui;overflow:auto}
         .ols-dialog::backdrop{background:#0006}.ols-dialog h2{margin:0 0 6px;font-size:19px}.ols-dialog p{margin:7px 0}
         .ols-options{display:grid;grid-template-columns:1fr 1fr;gap:6px 12px}.ols-dialog label{display:flex;align-items:center;gap:7px}.ols-dialog input{accent-color:#16834a}
@@ -39108,6 +39110,107 @@ ${output}
     };
   }
 
+  // src/local-tex-protocol.js
+  var localTexOrigin = "http://127.0.0.1:8766";
+  var maxProjectZip = 128 * 1024 * 1024;
+  var localTexReady = "ols-local-tex:ready";
+  var localTexProject = "ols-local-tex:project";
+  function isOverleafOrigin(origin) {
+    return origin === "https://www.overleaf.com" || origin === "https://overleaf.com" || origin === "https://cn.overleaf.com";
+  }
+
+  // src/local-tex.js
+  async function downloadProject(url) {
+    const response = await window.fetch(url, { cache: "no-store", signal: window.AbortSignal.timeout(12e4) });
+    if (!response.ok) throw new Error("\u65E0\u6CD5\u4E0B\u8F7D\u9879\u76EE\u6E90\u7801\uFF08HTTP " + response.status + "\uFF09\u3002");
+    if (!response.body) throw new Error("Overleaf \u672A\u8FD4\u56DE\u9879\u76EE ZIP\u3002");
+    if (Number(response.headers.get("content-length")) > maxProjectZip) {
+      throw new Error("\u672C\u5730\u7F16\u8BD1\u652F\u6301 128 MB \u4EE5\u5185\u7684\u9879\u76EE ZIP\u3002");
+    }
+    const chunks = [];
+    let length = 0;
+    const reader = response.body.getReader();
+    try {
+      for (; ; ) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        length += value.length;
+        if (length > maxProjectZip) {
+          await reader.cancel();
+          throw new Error("\u672C\u5730\u7F16\u8BD1\u652F\u6301 128 MB \u4EE5\u5185\u7684\u9879\u76EE ZIP\u3002");
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const zip = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) {
+      zip.set(chunk, offset);
+      offset += chunk.length;
+    }
+    if (zip[0] !== 80 || zip[1] !== 75) throw new Error("Overleaf \u672A\u8FD4\u56DE\u9879\u76EE ZIP\uFF0C\u8BF7\u68C0\u67E5\u767B\u5F55\u72B6\u6001\u3002");
+    return zip.buffer;
+  }
+  function mountLocalTexButton() {
+    const { pathname, origin } = window.location;
+    const projectPath = /^\/project\/([a-f\d]{24})\/?$/i.exec(pathname)?.[1];
+    if (!projectPath || !isOverleafOrigin(origin)) return;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ols-button ols-local-tex";
+    const label = "\u672C\u5730\u7F16\u8BD1";
+    const status = document.createElement("span");
+    status.className = "ols-local-tex-status";
+    status.setAttribute("role", "status");
+    status.hidden = true;
+    const archiveUrl = "/project/" + projectPath + "/download/zip";
+    const setStatus = (message) => {
+      status.textContent = message;
+      status.hidden = !message;
+    };
+    button.textContent = label;
+    button.title = "\u7528\u672C\u673A TeX \u7F16\u8BD1\u5F53\u524D\u9879\u76EE\uFF0C\u7ED3\u679C\u5728\u672C\u5730\u6807\u7B7E\u9875\u6253\u5F00";
+    document.body.append(button, status);
+    button.addEventListener("click", () => {
+      const session = window.crypto.randomUUID();
+      const fragment = new URLSearchParams({ session, origin });
+      const popup = window.open(localTexOrigin + "/#" + fragment, "_blank");
+      if (!popup) {
+        setStatus("\u8BF7\u5141\u8BB8 Overleaf \u6253\u5F00\u672C\u5730\u7F16\u8BD1\u7ED3\u679C\u6807\u7B7E\u9875\u3002");
+        return;
+      }
+      setStatus("");
+      button.disabled = true;
+      button.textContent = "\u6B63\u5728\u8FDE\u63A5\u672C\u5730\u7F16\u8BD1\u5668\u2026";
+      const timeout = setTimeout(() => {
+        window.removeEventListener("message", receive);
+        button.disabled = false;
+        button.textContent = label;
+        setStatus("\u672A\u8FDE\u63A5\u672C\u5730\u52A9\u624B\u3002\u8BF7\u8FD0\u884C node overleaf-local-tex.cjs\uFF0C\u518D\u70B9\u51FB\u672C\u5730\u7F16\u8BD1\u3002");
+      }, 15e3);
+      async function receive(event) {
+        if (event.origin !== localTexOrigin || event.source !== popup || event.data?.type !== localTexReady || event.data.session !== session) return;
+        window.removeEventListener("message", receive);
+        clearTimeout(timeout);
+        button.textContent = "\u6B63\u5728\u4E0B\u8F7D\u9879\u76EE\u6E90\u7801\u2026";
+        try {
+          const zip = await downloadProject(archiveUrl);
+          popup.postMessage({ type: localTexProject, session, project: projectPath, zip }, localTexOrigin, [zip]);
+        } catch (reason) {
+          const error = "\u8BFB\u53D6\u9879\u76EE\u6E90\u7801\u5931\u8D25\u3002" + reason.message;
+          popup.postMessage({ type: localTexProject, session, error }, localTexOrigin);
+          setStatus(error);
+        } finally {
+          button.disabled = false;
+          button.textContent = label;
+        }
+      }
+      window.addEventListener("message", receive);
+    });
+  }
+
   // src/main.js
   init_preferences();
   if (!window.__overleafLatexSuite1) {
@@ -39162,6 +39265,7 @@ ${output}
         toggleConceal
       });
       report();
+      mountLocalTexButton();
     };
     window.__overleafLatexSuite1 = true;
     let preferences = { ...defaults };
