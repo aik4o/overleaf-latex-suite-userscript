@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Overleaf LaTeX Suite
 // @namespace    local.overleaf-latex-suite
-// @version      2.1.5
+// @version      2.1.6
 // @description  完整原版片段集、JavaScript/节点片段、作用域、分数、矩阵、Conceal、预览和 Vim 辅助
 // @author       Local adaptation; artisticat1; superle3
 // @license      MIT
@@ -23309,6 +23309,263 @@ ${output}
     }
   });
 
+  // src/pdf-symbols.js
+  function normalizeGlyph(char) {
+    if (char === "\u2212") return "-";
+    if (/[\u2100-\u214f\u{1D400}-\u{1D7FF}]/u.test(char)) {
+      const plain = char.normalize("NFKC");
+      if (/^[\p{L}\p{N}]$/u.test(plain)) return plain;
+    }
+    return char;
+  }
+  function sourceGlyphs(source, from) {
+    const glyphs = [];
+    const wrappedGroups = [];
+    let pendingWrapper;
+    let namedOperator;
+    let skipTo = 0;
+    let depth = 0;
+    let scriptDepth = 0;
+    let nextScript = false;
+    for (const token of tokenize(source)) {
+      const { text: text2 } = token;
+      if (token.start < skipTo || text2.startsWith("%")) continue;
+      if (symbolWrappers.has(text2)) {
+        pendingWrapper ??= token.start;
+        namedOperator = text2 === "\\operatorname";
+        continue;
+      }
+      if (text2 === "*" && namedOperator) {
+        namedOperator = false;
+        continue;
+      }
+      const wrapperStart = pendingWrapper;
+      pendingWrapper = void 0;
+      namedOperator = false;
+      if (text2 === "_" || text2 === "^") {
+        nextScript = true;
+        continue;
+      }
+      const script2 = nextScript || scriptDepth > 0;
+      if (text2 === "{") {
+        depth++;
+        if (nextScript && !scriptDepth) scriptDepth = depth;
+        if (wrapperStart !== void 0) wrappedGroups.push({ depth, start: wrapperStart, first: glyphs.length });
+      } else if (text2 === "}") {
+        const group2 = wrappedGroups.at(-1);
+        if (group2?.depth === depth) {
+          const selection = { from: from + group2.start, to: from + token.end };
+          for (let i2 = group2.first; i2 < glyphs.length; i2++) glyphs[i2].selection = selection;
+          wrappedGroups.pop();
+        }
+        if (depth === scriptDepth) scriptDepth = 0;
+        depth--;
+      }
+      nextScript = false;
+      if (ignoredArguments.has(text2)) {
+        const argument = /^\s*\*?\s*\{[^{}]*\}/.exec(source.slice(token.end));
+        if (argument) skipTo = token.end + argument[0].length;
+        continue;
+      }
+      const command = text2.startsWith("\\");
+      const name = text2.slice(1);
+      const operator = command && operatorNames.has(name);
+      const char = operator ? name : command ? Object.hasOwn(commands, name) ? commands[name] : "" : text2;
+      if (!char || !operator && Array.from(char).length !== 1 || !command && "{}$_^&#".includes(char)) continue;
+      glyphs.push({
+        char: normalizeGlyph(char),
+        from: from + token.start,
+        to: from + token.end,
+        command,
+        script: script2,
+        selection: wrapperStart === void 0 ? void 0 : { from: from + wrapperStart, to: from + token.end }
+      });
+    }
+    return glyphs;
+  }
+  function pdfTextGeometry(click, position) {
+    if (!click) return null;
+    const { layer, x: x2, y: y2 } = click;
+    const page = layer.closest(".page[data-page-number]");
+    if (Number(page?.dataset.pageNumber) !== position.page + 1 || Number(layer.dataset.mainRotation || 0)) return null;
+    const canvas = page.querySelector("canvas");
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = (x2 - rect.left) / position.offset.left;
+    const scaleY = (y2 - rect.top) / position.offset.top;
+    if (!Number.isFinite(scaleX) || !Number.isFinite(scaleY) || scaleX <= 0 || scaleY <= 0 || Math.abs(scaleX / scaleY - 1) > 0.03 || !rect.width || !rect.height) return null;
+    return { layer, canvas, width: rect.width / scaleX, height: rect.height / scaleY };
+  }
+  function pdfWordAtClick({ layer, x: x2, y: y2 }) {
+    const point = document.caretPositionFromPoint?.(x2, y2);
+    const caret = point ? null : document.caretRangeFromPoint?.(x2, y2);
+    const node = point?.offsetNode ?? caret?.startContainer;
+    const offset = point?.offset ?? caret?.startOffset;
+    if (node?.nodeType !== 3 || !layer.contains(node)) return null;
+    for (const match of node.data.matchAll(wordPattern)) {
+      const start = match.index;
+      const end = start + match[0].length;
+      if (offset < start || offset > end) continue;
+      const range = pdfRange({ node, start, end });
+      const bounds = range.getBoundingClientRect();
+      if (x2 >= bounds.left && x2 <= bounds.right && y2 >= bounds.top && y2 <= bounds.bottom) return range;
+    }
+    return null;
+  }
+  function* pdfText(geometry, box, pattern, keyFor) {
+    const { layer, canvas, width, height } = geometry;
+    if (!layer.isConnected || Number(layer.dataset.mainRotation || 0)) return;
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const scaleX = rect.width / width;
+    const scaleY = rect.height / height;
+    const top = box.v - box.height;
+    const rowTop = rect.top + top * scaleY;
+    const rowBottom = rect.top + box.v * scaleY;
+    const walker = document.createTreeWalker(layer, window.NodeFilter.SHOW_TEXT);
+    const range = document.createRange();
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const run = node.parentElement.getBoundingClientRect();
+      if (run.bottom + run.height < rowTop || run.top - run.height > rowBottom) continue;
+      for (const match of node.data.matchAll(pattern)) {
+        const text2 = match[0];
+        const key = keyFor(text2);
+        if (key === void 0) continue;
+        const start = match.index;
+        const end = start + text2.length;
+        let bounds = run;
+        if (node.data !== text2 || node.parentElement.childNodes.length !== 1) {
+          range.setStart(node, start);
+          range.setEnd(node, end);
+          bounds = range.getBoundingClientRect();
+        }
+        if (!bounds.width || !bounds.height) continue;
+        const glyph = {
+          text: text2,
+          key,
+          node,
+          start,
+          end,
+          left: (bounds.left - rect.left) / scaleX,
+          right: (bounds.right - rect.left) / scaleX,
+          top: (bounds.top - rect.top) / scaleY,
+          bottom: (bounds.bottom - rect.top) / scaleY
+        };
+        const x2 = (glyph.left + glyph.right) / 2;
+        const y2 = (glyph.top + glyph.bottom) / 2;
+        const overhang = largeOperators.has(key) ? (glyph.bottom - glyph.top) / 2 : 1;
+        if (x2 < box.h - 1 || x2 > box.h + box.width + 1 || y2 < top - overhang || y2 > box.v + 1) continue;
+        yield glyph;
+      }
+    }
+  }
+  function pdfRange({ node, start, end }) {
+    const range = document.createRange();
+    range.setStart(node, start);
+    range.setEnd(node, end);
+    return range;
+  }
+  function hitsText({ left: x2, top: y2 }, glyph) {
+    return x2 >= glyph.left - 0.4 && x2 <= glyph.right + 0.4 && y2 >= glyph.top && y2 <= glyph.bottom;
+  }
+  function normalizeWord(word) {
+    return word.normalize("NFKC").replaceAll("\u2019", "'");
+  }
+  function sourceWords(source, from, glyphs, selected) {
+    if (!selected || selected.match(wordPattern)?.[0] !== selected) return [];
+    const word = normalizeWord(selected);
+    const matches = glyphs.filter((glyph) => glyph.command && normalizeWord(glyph.char) === word);
+    const literals = new Map(glyphs.filter((glyph) => !glyph.command).map((glyph) => [glyph.from, glyph]));
+    for (const match of source.matchAll(wordPattern)) {
+      const start = from + match.index;
+      const literal2 = literals.get(start);
+      if (literal2 && normalizeWord(match[0]) === word) {
+        const end = start + match[0].length;
+        matches.push({ from: start, to: end, selection: literal2.selection?.to >= end ? literal2.selection : void 0 });
+      }
+    }
+    return matches.sort((a, b2) => a.from - b2.from).map((match) => match.selection ?? match);
+  }
+  function wordSelection(geometry, box, position, words, selected) {
+    const unique = words.length === 1 ? words[0] : null;
+    if (!words.length || !geometry || !box) return unique;
+    const word = normalizeWord(selected);
+    const rendered = [...pdfText(geometry, box, wordPattern, (text2) => normalizeWord(text2) === word ? word : void 0)];
+    if (rendered.length !== words.length) return unique;
+    const hits = rendered.flatMap((item, index) => hitsText(position.offset, item) ? [index] : []);
+    return hits.length === 1 ? { ...words[hits[0]], pdfRange: pdfRange(rendered[hits[0]]) } : unique;
+  }
+  function symbolSelection(geometry, box, position, glyphs, source, allowLiteral, selectText) {
+    const selected = normalizeGlyph(selectText);
+    const selectedGlyphs = glyphs.filter((glyph2) => glyph2.char === selected);
+    const distinctive = selectedGlyphs.length === 1 ? selectedGlyphs[0] : null;
+    const selectedCommand = distinctive?.selection ?? (distinctive?.command ? distinctive : null);
+    if (!geometry) return selectedCommand;
+    const symbols2 = new Set(glyphs.map((glyph2) => glyph2.char));
+    const keyFor = (char) => {
+      const operator = legacyOperators.get(char);
+      return symbols2.has(operator) ? operator : char;
+    };
+    const bySymbol = /* @__PURE__ */ new Map();
+    for (const glyph2 of glyphs) {
+      const key = keyFor(glyph2.char);
+      if (!bySymbol.has(key)) bySymbol.set(key, []);
+      bySymbol.get(key).push(glyph2);
+    }
+    const operators2 = [...bySymbol.keys()].filter((key) => operatorNames.has(key)).sort((a, b2) => b2.length - a.length);
+    const pattern = operators2.length ? new RegExp(operators2.join("|") + "|\\S", "gu") : /\S/gu;
+    const pdf = /* @__PURE__ */ new Map();
+    for (const item of pdfText(geometry, box, pattern, (text2) => {
+      const key = keyFor(normalizeGlyph(text2));
+      return bySymbol.has(key) ? key : void 0;
+    })) {
+      if (!pdf.has(item.key)) pdf.set(item.key, []);
+      pdf.get(item.key).push(item);
+    }
+    const { left: x2, top: y2 } = position.offset;
+    const exact = [];
+    const tall = [];
+    const hasStackedAnnotations = /\\(?:over|under)set\b|\\stackrel\b/.test(source);
+    for (const [key, rendered] of pdf) {
+      const written = bySymbol.get(key);
+      if (written.length !== rendered.length || written.some((glyph2, i2) => {
+        const char = normalizeGlyph(rendered[i2].text);
+        return glyph2.char !== char && glyph2.char !== legacyOperators.get(char);
+      })) continue;
+      if (rendered.length > 1 && (written.some((glyph2) => glyph2.script) || hasStackedAnnotations) && rendered.some((glyph2, i2) => i2 && glyph2.left < rendered[i2 - 1].right - 1 && glyph2.top < rendered[i2 - 1].bottom && rendered[i2 - 1].top < glyph2.bottom)) continue;
+      for (const [i2, glyph2] of rendered.entries()) {
+        const token2 = written[i2];
+        if (!token2.command && !token2.selection && !allowLiteral) continue;
+        if (hitsText(position.offset, glyph2)) {
+          exact.push({ token: token2, glyph: glyph2 });
+        } else if (largeOperators.has(token2.char)) {
+          const height = glyph2.bottom - glyph2.top;
+          const width = height * (token2.char === "\u222B" ? 0.85 : 1.45);
+          if (x2 >= glyph2.left - 1 && x2 <= Math.max(glyph2.right, glyph2.left + width) && y2 >= glyph2.top && y2 <= glyph2.top + height * 3.3) tall.push({ token: token2, glyph: glyph2 });
+        }
+      }
+    }
+    const hits = exact.length ? exact : tall;
+    if (hits.length !== 1) return hits.length ? null : selectedCommand;
+    const { token, glyph } = hits[0];
+    const { from, to } = token.selection ?? token;
+    return { from, to, pdfRange: pdfRange(glyph) };
+  }
+  var commands, operatorNames, symbolWrappers, wordPattern, ignoredArguments, legacyOperators, largeOperators;
+  var init_pdf_symbols = __esm({
+    "src/pdf-symbols.js"() {
+      init_conceal_maps();
+      init_tokenizer();
+      commands = { ...cmd_symbols, ...greek2, intop: "\u222B", smallint: "\u222B" };
+      operatorNames = new Set("arccos arcsin arctan arg cos cosh cot coth csc deg det dim exp gcd hom inf ker lg lim ln log max min Pr sec sin sinh sup tan tanh".split(" "));
+      symbolWrappers = new Set("mathbf mathbb mathcal mathscr mathfrak mathrm mathit mathnormal mathsf mathtt boldsymbol bm symbf symbfit symbb symcal symfrak symit symscr symsf symtt symup hat widehat tilde widetilde bar overline underline vec overrightarrow overleftarrow dot ddot dddot check breve acute grave mathring operatorname".split(" ").map((name) => "\\" + name));
+      wordPattern = /[\p{L}\p{M}\p{N}]+(?:['’][\p{L}\p{M}\p{N}]+)*/gu;
+      ignoredArguments = /* @__PURE__ */ new Set(["\\begin", "\\end", "\\label", "\\tag", "\\phantom", "\\hphantom", "\\vphantom"]);
+      legacyOperators = /* @__PURE__ */ new Map([["R", "\u222B"], ["Z", "\u222B"], ["P", "\u2211"], ["X", "\u2211"], ["Q", "\u220F"], ["Y", "\u220F"]]);
+      largeOperators = new Set(legacyOperators.values());
+    }
+  });
+
   // src/preview-text.js
   function group(text2, start, open2 = "{", close2 = "}") {
     if (text2[start] !== open2) return null;
@@ -23400,7 +23657,24 @@ ${output}
     }
     return definitions;
   }
-  function decoratePreview(text2, cursor, settings) {
+  function previewCursorRange(text2, bounds, cursor) {
+    const glyphs = sourceGlyphs(text2, bounds.inner_start);
+    for (const side of [1, -1]) {
+      const glyph = side > 0 ? glyphs.find((glyph2) => glyph2.from <= cursor && cursor < glyph2.to) ?? glyphs.find(({ selection }) => selection && selection.from <= cursor && cursor < selection.to) : glyphs.findLast((glyph2) => glyph2.to === cursor || glyph2.selection?.to === cursor);
+      if (glyph) return glyph.selection ?? glyph;
+      for (let node = bounds.tree.resolve(cursor, side); node; node = node.parent) {
+        if (node.name !== "MathCommand") continue;
+        const source = text2.slice(node.from - bounds.inner_start, node.to - bounds.inner_start);
+        const command = /^\\[A-Za-z@]+/.exec(source)?.[0];
+        if (command && (cursor < node.from + command.length || side < 0 && cursor === node.to) && !/^\\(?:label|tag|notag|nonumber|quad|qquad|limits|nolimits|displaylimits)$/.test(command)) {
+          return { from: node.from, to: node.to };
+        }
+        break;
+      }
+    }
+  }
+  function cursorChanges(text2, cursor, settings) {
+    if (!settings.mathPreviewShowCursor && !settings.mathPreviewBracketHighlighting) return [];
     let pos = Math.max(0, Math.min(text2.length, cursor));
     for (const match of text2.matchAll(/\\(?:[A-Za-z@]+|.)/g)) {
       if (pos > match.index && pos < match.index + match[0].length) {
@@ -23424,17 +23698,14 @@ ${output}
     }
     const escape3 = (value) => value.replace(/[\\{}%$#_&^~]/g, (char) => ({ "\\": "\\textbackslash{}", "^": "\\textasciicircum{}", "~": "\\textasciitilde{}" })[char] ?? "\\" + char);
     const marker = settings.mathPreviewShowCursor && settings.mathPreviewCursor ? "\\htmlClass{ols-preview-cursor}{\\text{" + escape3(settings.mathPreviewCursor) + "}}" : "";
-    const changes = [{ at: pos, insert: marker, order: 1 }];
+    const changes = marker ? [{ at: pos, insert: marker, order: 2 }] : [];
     if (settings.mathPreviewBracketHighlighting && pair) {
       changes.push(
-        { at: pair.from + 1, insert: "\\htmlClass{ols-preview-highlight}{", order: 0 },
-        { at: pair.to, insert: "}", order: 2 }
+        { at: pair.from + 1, insert: "\\htmlClass{ols-preview-highlight}{", order: 1 },
+        { at: pair.to, insert: "}", order: 3 }
       );
     }
-    for (const change of changes.sort((a, b2) => b2.at - a.at || b2.order - a.order)) {
-      text2 = text2.slice(0, change.at) + change.insert + text2.slice(change.at);
-    }
-    return text2;
+    return changes;
   }
   function* selectedBodies(parent, from, to) {
     for (let node = parent.childAfter(from); node && node.from < to; node = node.nextSibling) {
@@ -23442,10 +23713,10 @@ ${output}
       else yield* selectedBodies(node, from, to);
     }
   }
-  function decoratePreviewSelection(text2, bounds, from, to) {
+  function selectionRanges(text2, bounds, { from, to }) {
     let body = bounds.tree.resolve(from, 1);
     while (body && (body.to < to || !isPreviewBody(body))) body = body.parent;
-    if (!body) return text2;
+    if (!body) return [];
     const offset = bounds.inner_start;
     const ranges = [];
     function collect(parent) {
@@ -23485,9 +23756,25 @@ ${output}
       finish();
     }
     collect(body);
-    for (const { from: from2, to: to2, script: script2 } of ranges.reverse()) {
-      const mark = "\\htmlClass{ols-preview-selection}{" + text2.slice(from2, to2) + "}";
-      text2 = text2.slice(0, from2) + (script2 ? "{" + mark + "}" : mark) + text2.slice(to2);
+    return ranges;
+  }
+  function decoratePreview(text2, bounds, range, cursor, settings) {
+    const changes = cursor === void 0 ? [] : cursorChanges(text2, cursor - bounds.inner_start, settings);
+    for (const { from, to, script: script2 } of range ? selectionRanges(text2, bounds, range) : []) {
+      const open2 = "\\htmlClass{ols-preview-selection}{";
+      if (script2) {
+        const marker = changes.find((change) => change.at === from && change.order === 2);
+        if (marker) marker.insert = "{" + marker.insert;
+        changes.push(
+          { at: from, insert: marker ? open2 : "{" + open2, order: 4 },
+          { at: to, insert: "}}", order: 0 }
+        );
+      } else {
+        changes.push({ at: from, insert: open2, order: 4 }, { at: to, insert: "}", order: 0 });
+      }
+    }
+    for (const { at: at2, insert: insert2 } of changes.sort((a, b2) => b2.at - a.at || b2.order - a.order)) {
+      text2 = text2.slice(0, at2) + insert2 + text2.slice(at2);
     }
     return text2;
   }
@@ -23503,6 +23790,7 @@ ${output}
   var isPreviewBody;
   var init_preview_text = __esm({
     "src/preview-text.js"() {
+      init_pdf_symbols();
       isPreviewBody = (node) => /^(Math|LongArg|ShortArg)$/.test(node.name);
     }
   });
@@ -37939,10 +38227,10 @@ ${output}
         document.body.append(this.node);
         this.formula = document.createElement("div");
         this.node.append(this.formula);
-        this.selectedSource = document.createElement("code");
-        this.selectedSource.className = "ols-preview-selected-source";
-        this.selectedSource.hidden = true;
-        this.node.append(this.selectedSource);
+        this.highlightedSource = document.createElement("code");
+        this.highlightedSource.className = "ols-preview-selected-source";
+        this.highlightedSource.hidden = true;
+        this.node.append(this.highlightedSource);
         this.status = document.createElement("div");
         this.status.className = "ols-preview-status";
         this.status.hidden = true;
@@ -38004,10 +38292,14 @@ ${output}
         const to = Math.min(selection.to, bounds.inner_end);
         const hasSelection = from < to;
         const wholeFormula = hasSelection && from === bounds.inner_start && to === bounds.inner_end;
-        const marked = hasSelection ? wholeFormula ? equation : decoratePreviewSelection(equation, bounds, from, to) : decoratePreview(equation, selection.head - bounds.inner_start, settings);
-        const selectedSource = hasSelection ? view.state.sliceDoc(selection.from, selection.to) : "";
-        if (this.selectedSource.textContent !== selectedSource) this.selectedSource.textContent = selectedSource;
-        this.selectedSource.hidden = !hasSelection;
+        const cursor = selection.empty ? selection.head : void 0;
+        const cursorRange = cursor === void 0 ? void 0 : previewCursorRange(equation, bounds, cursor);
+        const range = hasSelection ? { from, to } : cursorRange;
+        const marked = decoratePreview(equation, bounds, wholeFormula ? void 0 : range, cursor, settings);
+        const sourceRange2 = hasSelection ? selection : cursorRange;
+        const source = sourceRange2 ? view.state.sliceDoc(sourceRange2.from, sourceRange2.to) : "";
+        if (this.highlightedSource.textContent !== source) this.highlightedSource.textContent = source;
+        this.highlightedSource.hidden = !sourceRange2;
         const base = previewEnvironment(view.state, bounds, equation);
         const text2 = marked === equation ? base : previewEnvironment(view.state, bounds, marked);
         const display = settings.mathPreviewDisplayStyle || !inline;
@@ -38032,7 +38324,7 @@ ${output}
             try {
               render3(text2);
             } catch (reason) {
-              if (!hasSelection || text2 === base) throw reason;
+              if (text2 === base) throw reason;
               render3(base);
             }
             this.formula.replaceChildren(...rendered.childNodes);
@@ -38242,263 +38534,6 @@ ${output}
       init_codemirror();
       init_config();
       init_matrix_shortcuts();
-    }
-  });
-
-  // src/pdf-symbols.js
-  function normalizeGlyph(char) {
-    if (char === "\u2212") return "-";
-    if (/[\u2100-\u214f\u{1D400}-\u{1D7FF}]/u.test(char)) {
-      const plain = char.normalize("NFKC");
-      if (/^[\p{L}\p{N}]$/u.test(plain)) return plain;
-    }
-    return char;
-  }
-  function sourceGlyphs(source, from) {
-    const glyphs = [];
-    const wrappedGroups = [];
-    let pendingWrapper;
-    let namedOperator;
-    let skipTo = 0;
-    let depth = 0;
-    let scriptDepth = 0;
-    let nextScript = false;
-    for (const token of tokenize(source)) {
-      const { text: text2 } = token;
-      if (token.start < skipTo || text2.startsWith("%")) continue;
-      if (symbolWrappers.has(text2)) {
-        pendingWrapper ??= token.start;
-        namedOperator = text2 === "\\operatorname";
-        continue;
-      }
-      if (text2 === "*" && namedOperator) {
-        namedOperator = false;
-        continue;
-      }
-      const wrapperStart = pendingWrapper;
-      pendingWrapper = void 0;
-      namedOperator = false;
-      if (text2 === "_" || text2 === "^") {
-        nextScript = true;
-        continue;
-      }
-      const script2 = nextScript || scriptDepth > 0;
-      if (text2 === "{") {
-        depth++;
-        if (nextScript && !scriptDepth) scriptDepth = depth;
-        if (wrapperStart !== void 0) wrappedGroups.push({ depth, start: wrapperStart, first: glyphs.length });
-      } else if (text2 === "}") {
-        const group2 = wrappedGroups.at(-1);
-        if (group2?.depth === depth) {
-          const selection = { from: from + group2.start, to: from + token.end };
-          for (let i2 = group2.first; i2 < glyphs.length; i2++) glyphs[i2].selection = selection;
-          wrappedGroups.pop();
-        }
-        if (depth === scriptDepth) scriptDepth = 0;
-        depth--;
-      }
-      nextScript = false;
-      if (ignoredArguments.has(text2)) {
-        const argument = /^\s*\*?\s*\{[^{}]*\}/.exec(source.slice(token.end));
-        if (argument) skipTo = token.end + argument[0].length;
-        continue;
-      }
-      const command = text2.startsWith("\\");
-      const name = text2.slice(1);
-      const operator = command && operatorNames.has(name);
-      const char = operator ? name : command ? Object.hasOwn(commands, name) ? commands[name] : "" : text2;
-      if (!char || !operator && Array.from(char).length !== 1 || !command && "{}$_^&#".includes(char)) continue;
-      glyphs.push({
-        char: normalizeGlyph(char),
-        from: from + token.start,
-        to: from + token.end,
-        command,
-        script: script2,
-        selection: wrapperStart === void 0 ? void 0 : { from: from + wrapperStart, to: from + token.end }
-      });
-    }
-    return glyphs;
-  }
-  function pdfTextGeometry(click, position) {
-    if (!click) return null;
-    const { layer, x: x2, y: y2 } = click;
-    const page = layer.closest(".page[data-page-number]");
-    if (Number(page?.dataset.pageNumber) !== position.page + 1 || Number(layer.dataset.mainRotation || 0)) return null;
-    const canvas = page.querySelector("canvas");
-    if (!canvas) return null;
-    const rect = canvas.getBoundingClientRect();
-    const scaleX = (x2 - rect.left) / position.offset.left;
-    const scaleY = (y2 - rect.top) / position.offset.top;
-    if (!Number.isFinite(scaleX) || !Number.isFinite(scaleY) || scaleX <= 0 || scaleY <= 0 || Math.abs(scaleX / scaleY - 1) > 0.03 || !rect.width || !rect.height) return null;
-    return { layer, canvas, width: rect.width / scaleX, height: rect.height / scaleY };
-  }
-  function pdfWordAtClick({ layer, x: x2, y: y2 }) {
-    const point = document.caretPositionFromPoint?.(x2, y2);
-    const caret = point ? null : document.caretRangeFromPoint?.(x2, y2);
-    const node = point?.offsetNode ?? caret?.startContainer;
-    const offset = point?.offset ?? caret?.startOffset;
-    if (node?.nodeType !== 3 || !layer.contains(node)) return null;
-    for (const match of node.data.matchAll(wordPattern)) {
-      const start = match.index;
-      const end = start + match[0].length;
-      if (offset < start || offset > end) continue;
-      const range = pdfRange({ node, start, end });
-      const bounds = range.getBoundingClientRect();
-      if (x2 >= bounds.left && x2 <= bounds.right && y2 >= bounds.top && y2 <= bounds.bottom) return range;
-    }
-    return null;
-  }
-  function* pdfText(geometry, box, pattern, keyFor) {
-    const { layer, canvas, width, height } = geometry;
-    if (!layer.isConnected || Number(layer.dataset.mainRotation || 0)) return;
-    const rect = canvas.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
-    const scaleX = rect.width / width;
-    const scaleY = rect.height / height;
-    const top = box.v - box.height;
-    const rowTop = rect.top + top * scaleY;
-    const rowBottom = rect.top + box.v * scaleY;
-    const walker = document.createTreeWalker(layer, window.NodeFilter.SHOW_TEXT);
-    const range = document.createRange();
-    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-      const run = node.parentElement.getBoundingClientRect();
-      if (run.bottom + run.height < rowTop || run.top - run.height > rowBottom) continue;
-      for (const match of node.data.matchAll(pattern)) {
-        const text2 = match[0];
-        const key = keyFor(text2);
-        if (key === void 0) continue;
-        const start = match.index;
-        const end = start + text2.length;
-        let bounds = run;
-        if (node.data !== text2 || node.parentElement.childNodes.length !== 1) {
-          range.setStart(node, start);
-          range.setEnd(node, end);
-          bounds = range.getBoundingClientRect();
-        }
-        if (!bounds.width || !bounds.height) continue;
-        const glyph = {
-          text: text2,
-          key,
-          node,
-          start,
-          end,
-          left: (bounds.left - rect.left) / scaleX,
-          right: (bounds.right - rect.left) / scaleX,
-          top: (bounds.top - rect.top) / scaleY,
-          bottom: (bounds.bottom - rect.top) / scaleY
-        };
-        const x2 = (glyph.left + glyph.right) / 2;
-        const y2 = (glyph.top + glyph.bottom) / 2;
-        const overhang = largeOperators.has(key) ? (glyph.bottom - glyph.top) / 2 : 1;
-        if (x2 < box.h - 1 || x2 > box.h + box.width + 1 || y2 < top - overhang || y2 > box.v + 1) continue;
-        yield glyph;
-      }
-    }
-  }
-  function pdfRange({ node, start, end }) {
-    const range = document.createRange();
-    range.setStart(node, start);
-    range.setEnd(node, end);
-    return range;
-  }
-  function hitsText({ left: x2, top: y2 }, glyph) {
-    return x2 >= glyph.left - 0.4 && x2 <= glyph.right + 0.4 && y2 >= glyph.top && y2 <= glyph.bottom;
-  }
-  function normalizeWord(word) {
-    return word.normalize("NFKC").replaceAll("\u2019", "'");
-  }
-  function sourceWords(source, from, glyphs, selected) {
-    if (!selected || selected.match(wordPattern)?.[0] !== selected) return [];
-    const word = normalizeWord(selected);
-    const matches = glyphs.filter((glyph) => glyph.command && normalizeWord(glyph.char) === word);
-    const literals = new Map(glyphs.filter((glyph) => !glyph.command).map((glyph) => [glyph.from, glyph]));
-    for (const match of source.matchAll(wordPattern)) {
-      const start = from + match.index;
-      const literal2 = literals.get(start);
-      if (literal2 && normalizeWord(match[0]) === word) {
-        const end = start + match[0].length;
-        matches.push({ from: start, to: end, selection: literal2.selection?.to >= end ? literal2.selection : void 0 });
-      }
-    }
-    return matches.sort((a, b2) => a.from - b2.from).map((match) => match.selection ?? match);
-  }
-  function wordSelection(geometry, box, position, words, selected) {
-    const unique = words.length === 1 ? words[0] : null;
-    if (!words.length || !geometry || !box) return unique;
-    const word = normalizeWord(selected);
-    const rendered = [...pdfText(geometry, box, wordPattern, (text2) => normalizeWord(text2) === word ? word : void 0)];
-    if (rendered.length !== words.length) return unique;
-    const hits = rendered.flatMap((item, index) => hitsText(position.offset, item) ? [index] : []);
-    return hits.length === 1 ? { ...words[hits[0]], pdfRange: pdfRange(rendered[hits[0]]) } : unique;
-  }
-  function symbolSelection(geometry, box, position, glyphs, source, allowLiteral, selectText) {
-    const selected = normalizeGlyph(selectText);
-    const selectedGlyphs = glyphs.filter((glyph2) => glyph2.char === selected);
-    const distinctive = selectedGlyphs.length === 1 ? selectedGlyphs[0] : null;
-    const selectedCommand = distinctive?.selection ?? (distinctive?.command ? distinctive : null);
-    if (!geometry) return selectedCommand;
-    const symbols2 = new Set(glyphs.map((glyph2) => glyph2.char));
-    const keyFor = (char) => {
-      const operator = legacyOperators.get(char);
-      return symbols2.has(operator) ? operator : char;
-    };
-    const bySymbol = /* @__PURE__ */ new Map();
-    for (const glyph2 of glyphs) {
-      const key = keyFor(glyph2.char);
-      if (!bySymbol.has(key)) bySymbol.set(key, []);
-      bySymbol.get(key).push(glyph2);
-    }
-    const operators2 = [...bySymbol.keys()].filter((key) => operatorNames.has(key)).sort((a, b2) => b2.length - a.length);
-    const pattern = operators2.length ? new RegExp(operators2.join("|") + "|\\S", "gu") : /\S/gu;
-    const pdf = /* @__PURE__ */ new Map();
-    for (const item of pdfText(geometry, box, pattern, (text2) => {
-      const key = keyFor(normalizeGlyph(text2));
-      return bySymbol.has(key) ? key : void 0;
-    })) {
-      if (!pdf.has(item.key)) pdf.set(item.key, []);
-      pdf.get(item.key).push(item);
-    }
-    const { left: x2, top: y2 } = position.offset;
-    const exact = [];
-    const tall = [];
-    const hasStackedAnnotations = /\\(?:over|under)set\b|\\stackrel\b/.test(source);
-    for (const [key, rendered] of pdf) {
-      const written = bySymbol.get(key);
-      if (written.length !== rendered.length || written.some((glyph2, i2) => {
-        const char = normalizeGlyph(rendered[i2].text);
-        return glyph2.char !== char && glyph2.char !== legacyOperators.get(char);
-      })) continue;
-      if (rendered.length > 1 && (written.some((glyph2) => glyph2.script) || hasStackedAnnotations) && rendered.some((glyph2, i2) => i2 && glyph2.left < rendered[i2 - 1].right - 1 && glyph2.top < rendered[i2 - 1].bottom && rendered[i2 - 1].top < glyph2.bottom)) continue;
-      for (const [i2, glyph2] of rendered.entries()) {
-        const token2 = written[i2];
-        if (!token2.command && !token2.selection && !allowLiteral) continue;
-        if (hitsText(position.offset, glyph2)) {
-          exact.push({ token: token2, glyph: glyph2 });
-        } else if (largeOperators.has(token2.char)) {
-          const height = glyph2.bottom - glyph2.top;
-          const width = height * (token2.char === "\u222B" ? 0.85 : 1.45);
-          if (x2 >= glyph2.left - 1 && x2 <= Math.max(glyph2.right, glyph2.left + width) && y2 >= glyph2.top && y2 <= glyph2.top + height * 3.3) tall.push({ token: token2, glyph: glyph2 });
-        }
-      }
-    }
-    const hits = exact.length ? exact : tall;
-    if (hits.length !== 1) return hits.length ? null : selectedCommand;
-    const { token, glyph } = hits[0];
-    const { from, to } = token.selection ?? token;
-    return { from, to, pdfRange: pdfRange(glyph) };
-  }
-  var commands, operatorNames, symbolWrappers, wordPattern, ignoredArguments, legacyOperators, largeOperators;
-  var init_pdf_symbols = __esm({
-    "src/pdf-symbols.js"() {
-      init_conceal_maps();
-      init_tokenizer();
-      commands = { ...cmd_symbols, ...greek2, intop: "\u222B", smallint: "\u222B" };
-      operatorNames = new Set("arccos arcsin arctan arg cos cosh cot coth csc deg det dim exp gcd hom inf ker lg lim ln log max min Pr sec sin sinh sup tan tanh".split(" "));
-      symbolWrappers = new Set("mathbf mathbb mathcal mathscr mathfrak mathrm mathit mathnormal mathsf mathtt boldsymbol bm symbf symbfit symbb symcal symfrak symit symscr symsf symtt symup hat widehat tilde widetilde bar overline underline vec overrightarrow overleftarrow dot ddot dddot check breve acute grave mathring operatorname".split(" ").map((name) => "\\" + name));
-      wordPattern = /[\p{L}\p{M}\p{N}]+(?:['’][\p{L}\p{M}\p{N}]+)*/gu;
-      ignoredArguments = /* @__PURE__ */ new Set(["\\begin", "\\end", "\\label", "\\tag", "\\phantom", "\\hphantom", "\\vphantom"]);
-      legacyOperators = /* @__PURE__ */ new Map([["R", "\u222B"], ["Z", "\u222B"], ["P", "\u2211"], ["X", "\u2211"], ["Q", "\u220F"], ["Y", "\u220F"]]);
-      largeOperators = new Set(legacyOperators.values());
     }
   });
 
